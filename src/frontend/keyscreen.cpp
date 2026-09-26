@@ -1,137 +1,208 @@
-// keyscreen.cpp — 键位设置界面实现
+// keyscreen.cpp — 键位设置界面实现（矢量字体 + 窗口真实分辨率）
 //
-// 不用 SDL 的绘制指令逐像素画字，而是先在 256x240 的 ARGB 缓冲里合成整幅画面、
-// 再一次性上传纹理。理由：点阵字体是靠一堆 1x1 小方块拼出来的，
-// 逐方块调用 SDL_RenderFillRect 会有上千次绘制调用，直接软合成便宜得多。
+// 布局：左右两张玩家卡片，每张 8 行「动作 —— 按键」。
+// 交互保留了旧版的全部约定（冲突拦截、Esc 取消绑定、R 恢复默认、改动存盘），
+// 只是从点阵键盘界面换成了现在的样子，并补上了鼠标操作。
 #include "keyscreen.h"
 
-#include "font5x7.h"
-
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
-#include <vector>
+#include <string>
+
+using namespace fc::ui;
 
 namespace fc {
-
 namespace {
-
-// 配色：整体走深色，与游戏画面/编辑器深色主题一致
-constexpr u32 kBg        = 0x0F1620;
-constexpr u32 kPanel     = 0x18242F;
-constexpr u32 kPanelSel  = 0x1E4C8A;   // 当前选中的行
-constexpr u32 kPanelBind = 0x7A4E12;   // 正在等待按键的行
-constexpr u32 kBorder    = 0x33506E;
-constexpr u32 kText      = 0xE6EDF3;
-constexpr u32 kTextDim   = 0x7C8B99;
-constexpr u32 kAccent    = 0x4FA3FF;
-constexpr u32 kWarn      = 0xFFB020;
-constexpr u32 kOk        = 0x5CE430;
-
-constexpr int kRowY0   = 36;   // 第一行动作的 y
-constexpr int kRowStep = 13;   // 行距
-constexpr int kColX0   = 10;   // P1 列起点
-constexpr int kColStep = 124;  // 两列间距
-constexpr int kColW    = 116;  // 每列高亮条宽度
-constexpr int kKeyOffX = 42;   // 键名相对列起点的偏移
 
 std::string shortName(const std::string& path) {
     const size_t slash = path.find_last_of("/\\");
     return (slash == std::string::npos) ? path : path.substr(slash + 1);
 }
 
+constexpr int kPad = 24;
+
+// 单列卡片的行高：窗口矮的时候自动压缩，保证 8 行都塞得下
+int rowHeight(int cardH) {
+    const int usable = cardH - 58 - 16;
+    return std::max(30, std::min(46, usable / ACT_COUNT));
+}
+
 } // namespace
 
-void drawKeyConfigScreen(u32* p, const KeyMap& km, const KeyScreenView& v) {
-    std::fill(p, p + kScreenPixels, kBg);
+void drawKeyScreen(Ui& u, const KeyMap& km, const KeyScreenView& v) {
+    const int W = u.width(), H = u.height();
+    const int TOP = 66, BOTTOM = 56;
 
-    // 标题 + 分隔线
-    drawTextCenter5x7(p, kScreenWidth, kScreenHeight, kScreenWidth / 2, 6, "KEY CONFIG", kAccent);
-    fillRectBuf(p, kScreenWidth, kScreenHeight, 4, 17, kScreenWidth - 8, 1, kBorder);
+    // ---------------- 背景
+    u.clear(theme::bg);
+    u.gradientV(SDL_Rect{ 0, H - 300, W, 300 }, rgba(8, 11, 16, 0), theme::bgGlow);
 
-    // 两块面板
-    fillRectBuf(p, kScreenWidth, kScreenHeight, 4, 22, kScreenWidth - 8, 120, kPanel);
-    fillRectBuf(p, kScreenWidth, kScreenHeight, 4, 146, kScreenWidth - 8, 88, kPanel);
-    fillRectBuf(p, kScreenWidth, kScreenHeight, 4, 22, kScreenWidth - 8, 1, kBorder);
-    fillRectBuf(p, kScreenWidth, kScreenHeight, 4, 141, kScreenWidth - 8, 1, kBorder);
-    fillRectBuf(p, kScreenWidth, kScreenHeight, 4, 146, kScreenWidth - 8, 1, kBorder);
-    fillRectBuf(p, kScreenWidth, kScreenHeight, 4, 233, kScreenWidth - 8, 1, kBorder);
+    // ---------------- 顶栏
+    u.text(Font::Title, "键位设置", kPad, 20, theme::text);
+    u.text(Font::Small, "改动会自动保存，游戏里约 1 秒内热加载生效",
+           kPad + u.measure(Font::Title, "键位设置") + 16, 28, theme::textFaint);
+    if (!v.fileTag.empty())
+        u.textRight(Font::Mono, v.fileTag, W - kPad, 26, theme::textFaint);
+    u.hline(kPad, TOP - 12, W - kPad * 2, theme::line);
 
-    // 列标题
-    drawText5x7(p, kScreenWidth, kScreenHeight, 10, 26, "P1", kAccent);
-    drawText5x7(p, kScreenWidth, kScreenHeight, 10 + kColStep, 26, "P2", kAccent);
+    // ---------------- 两张玩家卡片
+    const int gap  = 22;
+    const int colW = std::min(430, (W - kPad * 2 - gap) / 2);
+    const int totalW = colW * 2 + gap;
+    const int x0 = (W - totalW) / 2;
+    const int cardH = std::min(H - TOP - BOTTOM - 34, 470);
 
-    // 8 个动作
     for (int pi = 0; pi < kPlayerCount; ++pi) {
-        const int xc = kColX0 + pi * kColStep;
+        const SDL_Rect card{ x0 + pi * (colW + gap), TOP, colW, cardH };
+        u.shadow(card, radius::Card, 13, 115);
+        u.round(card, radius::Card, theme::surfaceHi);
+        u.roundOutline(card, radius::Card, 1, theme::border);
+        u.hline(card.x + radius::Card, card.y, card.w - radius::Card * 2, rgba(255, 255, 255, 12));
+
+        // 卡片头
+        u.text(Font::Body, std::string("玩家 ") + char('1' + pi), card.x + 20, card.y + 14, theme::accent);
+        const std::string hint = (pi == 0) ? "默认 WASD + JK" : "默认 方向键 + ZX";
+        u.textRight(Font::Small, hint, card.x + card.w - 20, card.y + 18, theme::textFaint);
+        u.hline(card.x + 20, card.y + 44, card.w - 40, theme::line);
+
+        const int rowH = rowHeight(cardH);
         for (int a = 0; a < ACT_COUNT; ++a) {
-            const int ry = kRowY0 + a * kRowStep;
+            const int ry = card.y + 52 + a * rowH;
+            const SDL_Rect row{ card.x + 12, ry, card.w - 24, rowH - 4 };
             const bool sel = (pi == v.col && a == v.row);
             const bool bin = sel && v.binding;
 
-            if (sel)
-                fillRectBuf(p, kScreenWidth, kScreenHeight, xc - 4, ry - 3,
-                            kColW, 12, bin ? kPanelBind : kPanelSel);
+            if (sel) {
+                u.round(row, radius::Button, bin ? fade(theme::warn, 0.20f) : fade(theme::accent, 0.18f));
+                u.roundOutline(row, radius::Button, 1,
+                               bin ? fade(theme::warn, 0.75f) : fade(theme::accent, 0.70f));
+            }
 
-            drawText5x7(p, kScreenWidth, kScreenHeight, xc, ry,
-                        actionLabel(a), sel ? 0xFFFFFFu : kText);
+            const RGBA labelColor = sel ? theme::text : theme::textDim;
+            u.textVCenter(Font::Body, actionLabelCN(a), row.x + 14, row, labelColor);
 
             if (bin) {
                 if (v.blink)
-                    drawText5x7(p, kScreenWidth, kScreenHeight, xc + kKeyOffX, ry,
-                                "PRESS...", kWarn);
+                    u.textRight(Font::Body, "按下任意键…", row.x + row.w - 14, row.y + (row.h - u.lineHeight(Font::Body)) / 2, theme::warn);
             } else {
-                drawText5x7(p, kScreenWidth, kScreenHeight, xc + kKeyOffX, ry,
-                            keyName(km.get(pi, a)).c_str(), sel ? 0xFFFFFFu : kTextDim);
+                const SDL_Scancode sc = km.get(pi, a);
+                const std::string kn = keyName(sc);
+                // 键名做成小胶囊，和动作名形成区分
+                const int kw = u.measure(Font::Body, kn);
+                const SDL_Rect chipRect{ row.x + row.w - kw - 26, row.y + (row.h - 26) / 2, kw + 20, 26 };
+                if (sel) {
+                    u.round(chipRect, radius::Chip, fade(theme::accent, bin ? 0.25f : 0.30f));
+                    u.textCenter(Font::Body, kn, chipRect, theme::text);
+                } else {
+                    u.round(chipRect, radius::Chip, theme::surface);
+                    u.textCenter(Font::Body, kn, chipRect, theme::textDim);
+                }
             }
         }
     }
 
-    // 底部操作说明
-    drawText5x7(p, kScreenWidth, kScreenHeight, 10, 152, "MOVE    ARROWS / WASD", kText);
-    drawText5x7(p, kScreenWidth, kScreenHeight, 10, 164, "REBIND  ENTER", kText);
-    drawText5x7(p, kScreenWidth, kScreenHeight, 10, 176, "DEFAULT R        BACK  ESC", kText);
-    drawText5x7(p, kScreenWidth, kScreenHeight, 10, 188,
-                "ONE KEY CAN DRIVE ONLY ONE ACTION", kTextDim);
+    // ---------------- 状态行 / 操作说明
+    const int msgY = TOP + cardH + 16;
+    if (!v.msg.empty()) {
+        const int mw = u.measure(Font::Body, v.msg);
+        const SDL_Rect box{ (W - mw) / 2 - 18, msgY - 6, mw + 36, 36 };
+        u.round(box, radius::Button, fade(v.msgWarn ? theme::warn : theme::ok, 0.14f));
+        u.roundOutline(box, radius::Button, 1, fade(v.msgWarn ? theme::warn : theme::ok, 0.45f));
+        u.textCenter(Font::Body, v.msg, box, v.msgWarn ? theme::warn : theme::ok);
+    } else {
+        u.textCenter(Font::Small, "同一玩家内一个键只能对应一个动作；两个玩家用同一个键会给出提示但不拦截",
+                     SDL_Rect{ 0, msgY, W, 24 }, theme::textFaint);
+    }
 
-    // 状态行（限时显示，过期就回到默认提示）
-    if (!v.msg.empty())
-        drawText5x7(p, kScreenWidth, kScreenHeight, 10, 200, v.msg.c_str(),
-                    v.msgWarn ? kWarn : kOk);
-    else
-        drawText5x7(p, kScreenWidth, kScreenHeight, 10, 200,
-                    "DEFAULT  P1 = WASD + JK", kTextDim);
-
-    drawText5x7(p, kScreenWidth, kScreenHeight, 10, 212,
-                ("FILE  " + (v.fileTag.empty() ? std::string("fc-keys.cfg") : v.fileTag)).c_str(),
-                kTextDim);
-    drawText5x7(p, kScreenWidth, kScreenHeight, 10, 224,
-                "F2 / ESC  BACK TO GAME", kTextDim);
+    // 底栏
+    u.hline(0, H - BOTTOM, W, theme::line);
+    u.fill(SDL_Rect{ 0, H - BOTTOM + 1, W, BOTTOM - 1 }, rgba(12, 16, 22));
+    u.textVCenter(Font::Small, "方向键 / WASD  移动", kPad, SDL_Rect{ 0, H - BOTTOM + 14, 0, 18 }, theme::textFaint);
+    u.textVCenter(Font::Small, "Enter / 点击  改键", kPad + 200, SDL_Rect{ 0, H - BOTTOM + 14, 0, 18 }, theme::textFaint);
+    u.textVCenter(Font::Small, "R  恢复默认", kPad + 400, SDL_Rect{ 0, H - BOTTOM + 14, 0, 18 }, theme::textFaint);
+    u.textRight(Font::Small, "Esc  返回", W - kPad, H - BOTTOM + 28, theme::textDim);
 }
 
-bool runKeyConfigScreen(SDL_Window* win, SDL_Renderer* ren,
+bool runKeyConfigScreen(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                         const std::string& configPath, KeyMap& km, bool* quit) {
     if (quit) *quit = false;
-
-    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
-                                         SDL_TEXTUREACCESS_STREAMING,
-                                         kScreenWidth, kScreenHeight);
-    if (!tex) return false;
-    SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
-
-    std::vector<u32> buf(kScreenPixels, kBg);
 
     KeyScreenView v;
     v.fileTag = shortName(configPath);
 
-    bool changed = false;
-    u32  msgUntil = 0;          // 0 表示状态行一直有效（绑定提示用）
+    bool changed  = false;
+    u32  msgUntil = 0;          // 0 表示一直有效
 
     bool wantQuit = false;
-    bool done = false;
+    bool done     = false;
+
+    u64 prev = SDL_GetPerformanceCounter();
+    const u64 freq = SDL_GetPerformanceFrequency();
+
+    // 事件循环里要知道鼠标落在哪一行，先备好布局参数
+    const int W = ui.width(), H = ui.height();
+    const int TOP = 66, BOTTOM = 56;
+    const int gap = 22;
+    const int colW = std::min(430, (W - kPad * 2 - gap) / 2);
+    const int totalW = colW * 2 + gap;
+    const int x0 = (W - totalW) / 2;
+    const int cardH = std::min(H - TOP - BOTTOM - 34, 470);
+    const int rowH = rowHeight(cardH);
+
     while (!done) {
+        const u64 now = SDL_GetPerformanceCounter();
+        double dt = double(now - prev) / double(freq);
+        prev = now;
+        if (dt > 0.1) dt = 0.1;
+        ui.tick(dt);
+
         // ---------------------------------------------------------- 事件
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) { wantQuit = true; done = true; break; }
+
+            if (e.type == SDL_WINDOWEVENT &&
+                (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                 e.window.event == SDL_WINDOWEVENT_RESIZED)) {
+                int nw = 0, nh = 0;
+                SDL_GetRendererOutputSize(ren, &nw, &nh);
+                ui.setViewport(nw, nh);
+                continue;
+            }
+
+            // 鼠标：点行选中，点已选中的行进入改键
+            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                int ow = 0, ww = 0;
+                SDL_GetRendererOutputSize(ren, &ow, nullptr);
+                SDL_GetWindowSize(win, &ww, nullptr);
+                const float k = (ww > 0) ? float(ow) / float(ww) : 1.0f;
+                const float mx = float(e.button.x) * k;
+                const float my = float(e.button.y) * k;
+
+                for (int pi = 0; pi < kPlayerCount; ++pi) {
+                    for (int a = 0; a < ACT_COUNT; ++a) {
+                        const SDL_Rect row{ x0 + pi * (colW + gap) + 12,
+                                            TOP + 52 + a * rowH, colW - 24, rowH - 4 };
+                        if (mx >= float(row.x) && mx < float(row.x + row.w) &&
+                            my >= float(row.y) && my < float(row.y + row.h)) {
+                            if (!v.binding) {
+                                if (v.col == pi && v.row == a) {
+                                    v.binding = true;
+                                    v.msg = "按下想绑定的按键（Esc 取消）";
+                                    v.msgWarn = false;
+                                    msgUntil = 0;
+                                } else {
+                                    v.col = pi;
+                                    v.row = a;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             if (e.type != SDL_KEYDOWN) continue;
 
             const SDL_Scancode sc = e.key.keysym.scancode;
@@ -140,7 +211,7 @@ bool runKeyConfigScreen(SDL_Window* win, SDL_Renderer* ren,
                 // 绑定状态下 Esc 一律当「取消」，否则一旦把 Esc 绑进去就出不来了
                 if (sc == SDL_SCANCODE_ESCAPE) {
                     v.binding = false;
-                    v.msg = "CANCELLED";
+                    v.msg = "已取消";
                     v.msgWarn = false;
                     msgUntil = SDL_GetTicks() + 1200;
                     continue;
@@ -148,7 +219,7 @@ bool runKeyConfigScreen(SDL_Window* win, SDL_Renderer* ren,
                 const int other = km.conflictIn(v.col, sc, v.row);
                 if (other >= 0) {
                     // 同一玩家内不允许一个键管两个动作，否则游戏里必然串键
-                    v.msg = std::string("ALREADY USED BY ") + actionLabel(other);
+                    v.msg = std::string("已被「") + actionLabelCN(other) + "」占用";
                     v.msgWarn = true;
                     msgUntil = SDL_GetTicks() + 2500;
                     continue;
@@ -156,30 +227,33 @@ bool runKeyConfigScreen(SDL_Window* win, SDL_Renderer* ren,
                 km.set(v.col, v.row, sc);
                 changed = true;
                 v.binding = false;
-                v.msg = std::string("P") + char('1' + v.col) + " " + actionLabel(v.row) +
+                v.msg = std::string("玩家 ") + char('1' + v.col) + " · " + actionLabelCN(v.row) +
                         " = " + keyName(sc);
                 v.msgWarn = km.overlapsOtherPlayer(v.col, sc);
-                if (v.msgWarn)
-                    v.msg += "  (ALSO USED BY " + std::string(1, char('1' + (1 - v.col))) + "P)";
+                if (v.msgWarn) v.msg += "（该键同时被另一个玩家使用）";
                 msgUntil = SDL_GetTicks() + 2500;
                 continue;
             }
 
             switch (sc) {
-                case SDL_SCANCODE_UP:    case SDL_SCANCODE_W: v.row = (v.row + ACT_COUNT - 1) % ACT_COUNT; break;
-                case SDL_SCANCODE_DOWN:  case SDL_SCANCODE_S: v.row = (v.row + 1) % ACT_COUNT; break;
-                case SDL_SCANCODE_LEFT:  case SDL_SCANCODE_A: v.col ^= 1; break;
-                case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: v.col ^= 1; break;
+                case SDL_SCANCODE_UP:    case SDL_SCANCODE_W:
+                    v.row = (v.row + ACT_COUNT - 1) % ACT_COUNT; break;
+                case SDL_SCANCODE_DOWN:  case SDL_SCANCODE_S:
+                    v.row = (v.row + 1) % ACT_COUNT; break;
+                case SDL_SCANCODE_LEFT:  case SDL_SCANCODE_A:
+                    v.col ^= 1; break;
+                case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D:
+                    v.col ^= 1; break;
                 case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER:
                     v.binding = true;
-                    v.msg = "PRESS ANY KEY  (ESC = CANCEL)";
+                    v.msg = "按下想绑定的按键（Esc 取消）";
                     v.msgWarn = false;
                     msgUntil = 0;
                     break;
                 case SDL_SCANCODE_R:
                     km.setDefaults();
                     changed = true;
-                    v.msg = "RESTORED DEFAULT KEYS";
+                    v.msg = "已恢复默认键位";
                     v.msgWarn = false;
                     msgUntil = SDL_GetTicks() + 2500;
                     break;
@@ -194,22 +268,14 @@ bool runKeyConfigScreen(SDL_Window* win, SDL_Renderer* ren,
         if (wantQuit) break;
 
         // ---------------------------------------------------------- 画面
-        const u32 now = SDL_GetTicks();
-        v.blink = ((now / 350) % 2) == 0;
-        if (msgUntil != 0 && now >= msgUntil) { v.msg.clear(); msgUntil = 0; }
+        const u32 t = SDL_GetTicks();
+        v.blink = ((t / 380) % 2) == 0;
+        if (msgUntil != 0 && t >= msgUntil) { v.msg.clear(); msgUntil = 0; }
 
-        drawKeyConfigScreen(buf.data(), km, v);
-
-        SDL_UpdateTexture(tex, nullptr, buf.data(), kScreenWidth * 4);
-        SDL_RenderClear(ren);
-        SDL_RenderCopy(ren, tex, nullptr, nullptr);
+        drawKeyScreen(ui, km, v);
         SDL_RenderPresent(ren);
-        if (win) SDL_SetWindowTitle(win, "fc-emulator — 键位设置（F2/Esc 返回游戏）");
-
-        SDL_Delay(16);
+        SDL_Delay(1);
     }
-
-    SDL_DestroyTexture(tex);
 
     if (changed) {
         if (km.save(configPath))

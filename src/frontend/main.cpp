@@ -1,7 +1,19 @@
-// main.cpp — SDL2 前端：窗口/渲染/音频/输入/主循环/联机接入
+// main.cpp — SDL2 前端：启动器 / 窗口 / 渲染 / 音频 / 输入 / 主循环 / 联机接入
+//
+// 界面架构：
+//   没有给 ROM 参数 → 先进图形启动器，选好 ROM 与联机设置再开始；
+//   给了 ROM 参数   → 直接进游戏（脚本、批处理、老用法不受影响）。
+//   游戏里 Esc / F1 唤出暂停菜单；联机时菜单只是叠加层，模拟不会停 ——
+//   锁步一旦停住，对端会一直等这一帧直到超时。
+//
+// 渲染坐标：不再用 SDL_RenderSetLogicalSize 把一切缩放到 256x240，而是
+//   用窗口真实像素绘制界面，游戏画面按整数倍缩放居中。这样界面能用矢量字体
+//   画得清楚，像素画面也不会因为非整数缩放而糊掉。
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -12,6 +24,9 @@
 
 #include "keycfg.h"
 #include "keyscreen.h"
+#include "launcher.h"
+#include "pausemenu.h"
+#include "ui.h"
 
 #ifdef _WIN32
 #  include <windows.h>      // SetConsoleOutputCP：修 Windows 控制台中文乱码
@@ -23,6 +38,10 @@ namespace {
 
 constexpr double kFrameMs = 1000.0 / 60.0988;   // NTSC 帧周期
 
+// 启动器窗口的初始尺寸。够大才放得下三栏布局，用户也可以随意拉。
+constexpr int kInitWindowW = 1280;
+constexpr int kInitWindowH = 720;
+
 struct Options {
     std::string rom;
     bool host = false;
@@ -33,6 +52,7 @@ struct Options {
     int  delay = 3;
     bool delaySet = false;
     int  scale = 3;
+    bool scaleSet = false;
     bool fullscreen = false;
     bool noAudio = false;
     std::string stateFile;
@@ -44,16 +64,26 @@ struct Options {
     std::string room = "7777";
     // 键位
     std::string keyFile;      // 为空则用默认位置
-    std::string keyPreview;   // 开发者自测：把键位界面导出成 PPM 后退出
-    int fpsLog = 0;           // 开发者自测：跑满 N 帧后打印实测帧率并退出（0=关闭）
+    // 开发者自测
+    std::string shot;         // --shot <界面名>：把某个界面离屏渲染成图片后退出
+    std::string shotFile;     // 输出文件名（.ppm）
+    int fpsLog = 0;           // 跑满 N 帧后打印实测帧率并退出（0=关闭）
 };
 
 void usage() {
     std::printf(
-        "fc-emulator — FC/NES 模拟器（SDL2 + 锁步联机）\n"
+        "fc-emulator — FC/NES 模拟器（SDL2 + 锁步联机 + 图形启动器）\n"
         "\n"
         "用法:\n"
-        "  fc-emulator <rom.nes> [选项]\n"
+        "  fc-emulator                       打开图形启动器（选 ROM、配联机、调设置）\n"
+        "  fc-emulator <rom.nes> [选项]       跳过启动器直接进游戏\n"
+        "\n"
+        "游戏内操作:\n"
+        "  Esc / F1   暂停菜单（继续 / 存档 / 读档 / 键位 / 全屏 / 缩放 / 退出）\n"
+        "  F5=存档  F8=读档  F2=键位设置  F11=全屏  Tab=加速(按住，仅单机)\n"
+        "  默认 P1 方向=WASD  A=J  B=K  Select=右Shift  Start=回车\n"
+        "  默认 P2 方向=方向键 A=Z  B=X  Select=右Ctrl   Start=右Alt\n"
+        "  手柄自动识别（A/B/Start/Back/十字键/左摇杆）\n"
         "\n"
         "联机（局域网 / 主机有公网 IP）:\n"
         "  --host [端口]              作为主机开房（默认端口 7777）\n"
@@ -65,24 +95,18 @@ void usage() {
         "  --room <房间号>            房间号，两端必须一致（默认 7777）\n"
         "  例: fc-emulator game.nes --relay 1.2.3.4:7777 --room 1234 --host\n"
         "      fc-emulator game.nes --relay 1.2.3.4:7777 --room 1234 --connect\n"
-        "      （中继模式下 --host 的端口与 --connect 的地址都可省略）\n"
         "\n"
         "显示/音频:\n"
-        "  --scale <n>                窗口放大倍率，默认 3\n"
+        "  --scale <n>                游戏画面放大倍数，默认按窗口自动取整数倍\n"
         "  --fullscreen               全屏启动\n"
         "  --no-audio                 关闭音频\n"
         "\n"
         "按键:\n"
-        "  默认 P1 方向=WASD   A=J  B=K  Select=右Shift  Start=回车\n"
-        "  默认 P2 方向=方向键 A=Z  B=X  Select=右Ctrl   Start=右Alt\n"
-        "  F2=键位设置（可逐键自定义，自动存到 fc-keys.cfg）\n"
         "  --keys <文件>              指定键位配置文件（默认 <exe目录>/fc-keys.cfg）\n"
         "  配置文件支持热加载：在外部编辑器改完保存，约 1 秒内自动生效（联机中也生效）\n"
-        "  --keypreview <图.ppm>      开发者自测：把键位界面导出成图片后退出\n"
-        "  手柄自动识别（A/B/Start/Back/十字键/左摇杆）\n"
         "\n"
         "存档:\n"
-        "  F5=存档（写到 <rom>.fcstate）  F8=读档\n"
+        "  存档写到 <rom>.fcstate。\n"
         "  单机：F5 / F8 都可用。\n"
         "  联机：F5 仍可存档（纯本地读取、不影响同步），但 F8 读档被禁用。\n"
         "  --load-state <文件>        启动时先载入存档，再进入游戏/联机\n"
@@ -91,9 +115,10 @@ void usage() {
         "      fc-emulator game.nes --load-state resume.fcstate --connect <IP>\n"
         "  两端 ROM 与存档必须完全一致，否则一连上就会报不同步（这是故意的）。\n"
         "\n"
-        "其它:\n"
-        "  F11=全屏  Tab=加速(按住，仅单机)  Esc=退出\n"
-        "  --fps-log <帧数>           开发者自测：跑满 N 帧后打印实测帧率并退出\n");
+        "开发者自测:\n"
+        "  --shot <界面> <文件.ppm>   离屏渲染界面并存图后退出\n"
+        "                             界面: launcher | netplay | settings | keys | pause\n"
+        "  --fps-log <帧数>           跑满 N 帧后打印实测帧率并退出\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& o) {
@@ -139,6 +164,7 @@ bool parseArgs(int argc, char** argv, Options& o) {
             if (o.room.empty()) o.room = "7777";
         } else if (a == "--scale") {
             o.scale = std::atoi(next("3").c_str());
+            o.scaleSet = true;
             if (o.scale < 1) o.scale = 1;
             if (o.scale > 10) o.scale = 10;
         } else if (a == "--fullscreen") {
@@ -149,8 +175,10 @@ bool parseArgs(int argc, char** argv, Options& o) {
             o.noAudio = true;
         } else if (a == "--keys") {
             o.keyFile = next("");
-        } else if (a == "--keypreview") {
-            o.keyPreview = next("");
+        } else if (a == "--shot") {
+            o.shot = next("");
+            o.shotFile = next("");
+            if (o.shotFile.empty()) o.shotFile = "shot.ppm";
         } else if (a == "--fps-log") {
             o.fpsLog = std::atoi(next("0").c_str());
         } else if (!a.empty() && a[0] != '-') {
@@ -185,6 +213,11 @@ std::string baseName(const std::string& path) {
     const size_t dot = s.find_last_of('.');
     if (dot != std::string::npos && dot > 0) s = s.substr(0, dot);
     return s;
+}
+
+std::string shortName(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return (slash == std::string::npos) ? path : path.substr(slash + 1);
 }
 
 u8 samplePad(SDL_GameController* gc) {
@@ -227,6 +260,13 @@ bool readFile(const std::string& path, std::vector<u8>& data) {
     return n > 0;
 }
 
+bool fileExists(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fclose(f);
+    return true;
+}
+
 // 写 PPM（无依赖的图片格式，项目里的 tools/ppm2png.py 可转 PNG）
 bool writePPM(const std::string& path, const u32* fb, int w, int h) {
     std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -245,6 +285,15 @@ bool writePPM(const std::string& path, const u32* fb, int w, int h) {
     return true;
 }
 
+// 游戏画面的目标矩形：整数倍缩放居中，霓虹黑边（像素完美，不会糊）
+SDL_Rect gameRectFor(int winW, int winH, int scaleSetting) {
+    int s = scaleSetting;
+    if (s <= 0) s = std::max(1, std::min(winW / kScreenWidth, winH / kScreenHeight));
+    const int w = kScreenWidth * s;
+    const int h = kScreenHeight * s;
+    return SDL_Rect{ (winW - w) / 2, (winH - h) / 2, w, h };
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -255,7 +304,6 @@ int main(int argc, char** argv) {
 #endif
     Options opt;
     if (!parseArgs(argc, argv, opt)) { usage(); return 1; }
-    if (opt.rom.empty()) { usage(); return 1; }
 
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) != 0) {
@@ -263,145 +311,260 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ------------------------------------------------------------ 窗口
+    // 窗口统一按启动器尺寸来，游戏画面在里面整数缩放居中。
+    // 好处是进游戏不用改窗口大小，进出暂停菜单也不会跳尺寸。
+    SDL_Window* win = SDL_CreateWindow(
+        "fc-emulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        kInitWindowW, kInitWindowH,
+        SDL_WINDOW_RESIZABLE | (opt.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+    if (!win) { std::fprintf(stderr, "创建窗口失败: %s\n", SDL_GetError()); SDL_Quit(); return 1; }
+
+    // 截图模式用软件渲染，保证 target texture 一定可用
+    SDL_Renderer* ren = nullptr;
+    if (opt.shot.empty()) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    if (!ren) {
+        std::fprintf(stderr, "创建渲染器失败: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win); SDL_Quit(); return 1;
+    }
+    SDL_SetWindowMinimumSize(win, 960, 620);
+
+    ui::Ui ui;
+    if (!ui.init(ren)) {
+        std::fprintf(stderr, "界面初始化失败：%s\n", ui.diag().c_str());
+        SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit();
+        return 1;
+    }
+    {
+        int ow = 0, oh = 0;
+        SDL_GetRendererOutputSize(ren, &ow, &oh);
+        ui.setViewport(ow, oh);
+    }
+    std::printf("字体    : %s\n", ui.fontPath().c_str());
+
+    // ------------------------------------------------------------ 配置
+    LaunchConfig cfg;
+    cfg.load(LaunchConfig::defaultPath());
+    const std::string keyFile = opt.keyFile.empty() ? defaultKeyConfigPath() : opt.keyFile;
+
+    // 命令行参数优先于上次保存的启动器配置
+    if (!opt.rom.empty()) cfg.rom = opt.rom;
+    if (opt.host)    { cfg.net = LaunchConfig::Net::Host;   cfg.hostPort = opt.hostPort; }
+    if (opt.connect) { cfg.net = LaunchConfig::Net::Client; cfg.hostIp = opt.hostIp;
+                       cfg.connectPort = opt.connectPort; }
+    if (opt.relay)   { cfg.relay = true; cfg.relayIp = opt.relayIp;
+                       cfg.relayPort = opt.relayPort; cfg.room = opt.room; }
+    if (opt.delaySet) cfg.delay = opt.delay;
+    if (opt.scaleSet) cfg.scale = opt.scale;
+    if (opt.fullscreen) cfg.fullscreen = true;
+    if (opt.noAudio) cfg.audio = false;
+    if (!opt.loadState.empty()) cfg.loadState = opt.loadState;
+
+    // ------------------------------------------------------------ 离屏截图（开发自测）
+    // 这套界面全是像素级细节（圆角、阴影、字体回退、对齐），靠读代码判断不了对错，
+    // 必须能一键出图肉眼比对。--shot 就是干这个的。
+    if (!opt.shot.empty()) {
+        SDL_Texture* tgt = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                             SDL_TEXTUREACCESS_TARGET, ui.width(), ui.height());
+        if (!tgt) {
+            std::fprintf(stderr, "创建离屏目标失败: %s\n", SDL_GetError());
+        } else {
+            SDL_SetRenderTarget(ren, tgt);
+
+            if (opt.shot == "keys") {
+                KeyMap km;
+                km.setDefaults();
+                km.load(keyFile);
+                KeyScreenView kv;
+                kv.fileTag = shortName(keyFile);
+                kv.msg = "玩家 1 · A = J";
+                drawKeyScreen(ui, km, kv);
+            } else if (opt.shot == "pause") {
+                // 先铺一层示意背景，方便看出遮罩的层次
+                ui.clear(ui::rgba(12, 18, 28));
+                ui.gradientV(SDL_Rect{ 0, 0, ui.width(), ui.height() },
+                             ui::rgba(24, 40, 62), ui::rgba(8, 11, 16));
+                PauseInfo pi;
+                pi.romName = "68in1_HKX5268";
+                pi.fps = 60;
+                ui::Input in;
+                in.mx = -100; in.my = -100;
+                pauseMenuFrame(ui, pi, in, 0.0);
+            } else {
+                int tab = 0;
+                if (opt.shot == "netplay")  tab = 1;
+                if (opt.shot == "settings") tab = 2;
+                drawLauncherPreview(ui, cfg, tab);
+            }
+
+            std::vector<u32> px(size_t(ui.width()) * size_t(ui.height()));
+            if (SDL_RenderReadPixels(ren, nullptr, SDL_PIXELFORMAT_ARGB8888,
+                                     px.data(), ui.width() * 4) != 0) {
+                std::fprintf(stderr, "读像素失败: %s\n", SDL_GetError());
+            } else if (writePPM(opt.shotFile, px.data(), ui.width(), ui.height())) {
+                std::printf("已导出界面截图: %s (%dx%d)\n",
+                            opt.shotFile.c_str(), ui.width(), ui.height());
+            } else {
+                std::fprintf(stderr, "写文件失败: %s\n", opt.shotFile.c_str());
+            }
+            SDL_DestroyTexture(tgt);
+        }
+        ui.shutdown();
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 0;
+    }
+
+    // ------------------------------------------------------------ 启动器
+    if (opt.rom.empty()) {
+        std::printf("=== fc-emulator 启动器 ===\n");
+        if (!runLauncher(win, ren, ui, cfg, keyFile)) {
+            ui.shutdown();
+            SDL_DestroyRenderer(ren);
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            std::printf("已退出。\n");
+            return 0;
+        }
+        // 启动器可能改过窗口尺寸，重新同步一次视口
+        int ow = 0, oh = 0;
+        SDL_GetRendererOutputSize(ren, &ow, &oh);
+        ui.setViewport(ow, oh);
+    }
+
+    // ------------------------------------------------------------ 载入 ROM
     Emulator emu;
-    if (!emu.loadROM(opt.rom)) {
-        std::fprintf(stderr, "ROM 加载失败（需要 iNES/NES2.0 格式的 .nes 文件）: %s\n", opt.rom.c_str());
+    if (!emu.loadROM(cfg.rom)) {
+        std::fprintf(stderr, "ROM 加载失败（需要 iNES/NES2.0 格式的 .nes 文件）: %s\n", cfg.rom.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "fc-emulator",
+                                 ("ROM 加载失败：\n" + cfg.rom).c_str(), win);
+        ui.shutdown();
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
         SDL_Quit();
         return 1;
     }
 
-    const std::string title = baseName(opt.rom);
+    const std::string title = baseName(cfg.rom);
     std::printf("=== fc-emulator ===\n");
     std::printf("ROM     : %s\n", title.c_str());
     std::printf("Mapper  : %s\n", emu.cartridge().mapperName());
     std::printf("镜像    : %d\n", emu.cartridge().mirrorMode());
 
     // ------------------------------------------------------------ 启动即读档
-    // 这是「从某个进度接着联机」的关键：Esc 会直接退出整个程序，而联机只能由
-    // 命令行开启，所以没有这个选项时根本没法带着内存里的档进入联机（一重启就丢）。
+    // 这是「从某个进度接着联机」的关键：联机只能由命令行/启动器开启，没有这个选项
+    // 时根本没法带着内存里的档进入联机（一重启就丢）。
     // 加载失败必须硬报错退出 —— 若静默地从开机状态起跑，联机时只会看到莫名其妙的
     // 「不同步」，反而更难查。
-    if (!opt.loadState.empty()) {
+    if (!cfg.loadState.empty()) {
         std::vector<u8> buf;
         std::string why;
-        if (!readFile(opt.loadState, buf)) {
-            std::fprintf(stderr, "读档失败: 打不开 %s\n", opt.loadState.c_str());
-            SDL_Quit();
+        if (!readFile(cfg.loadState, buf)) {
+            std::fprintf(stderr, "读档失败: 打不开 %s\n", cfg.loadState.c_str());
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "fc-emulator",
+                                     ("读档失败：打不开\n" + cfg.loadState).c_str(), win);
+            ui.shutdown(); SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit();
             return 1;
         }
         if (!emu.loadState(buf.data(), buf.size(), &why)) {
-            std::fprintf(stderr, "读档失败: %s —— %s\n", opt.loadState.c_str(), why.c_str());
-            SDL_Quit();
+            std::fprintf(stderr, "读档失败: %s —— %s\n", cfg.loadState.c_str(), why.c_str());
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "fc-emulator",
+                                     ("读档失败：\n" + why).c_str(), win);
+            ui.shutdown(); SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit();
             return 1;
         }
         std::printf("读档    : %s（从第 %llu 帧继续）\n",
-                    opt.loadState.c_str(), (unsigned long long)emu.frameCount());
+                    cfg.loadState.c_str(), (unsigned long long)emu.frameCount());
     }
 
-    // ------------------------------------------------------------ 窗口
-    // 必须在联机握手之前建好：主机等客机时窗口要立刻可见，
-    // 否则看起来就像程序卡死了（旧版正是这个表现）。
-    SDL_Window* win = SDL_CreateWindow(
-        title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        kScreenWidth * opt.scale, kScreenHeight * opt.scale,
-        SDL_WINDOW_RESIZABLE | (opt.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
-    if (!win) { std::fprintf(stderr, "创建窗口失败: %s\n", SDL_GetError()); SDL_Quit(); return 1; }
-
-    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
-    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
-    SDL_RenderSetLogicalSize(ren, kScreenWidth, kScreenHeight);
-
-    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
-                                         SDL_TEXTUREACCESS_STREAMING, kScreenWidth, kScreenHeight);
-    if (!tex) { std::fprintf(stderr, "创建纹理失败: %s\n", SDL_GetError()); SDL_Quit(); return 1; }
-    SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
-
-    // ------------------------------------------------------------ 联机
-    NetSession net;
-    opt.stateFile = opt.rom + ".fcstate";
-
+    // ------------------------------------------------------------ 等待界面
     // 握手等待期间被反复调用：泵 SDL 事件（窗口因此不会「未响应」）+ 重绘等待动画，
-    // 按 Esc 或关闭窗口即取消。SDL2 不带字体，所以用三个跳动的方块表示「进行中」。
+    // 按 Esc 或关闭窗口即取消。
     u32 lastDraw = 0;
-    auto waitScreen = [&](const char* what) -> bool {
+    auto waitScreen = [&](const std::string& what) -> bool {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) return false;
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) return false;
         }
-        SDL_SetWindowTitle(win, what);                 // SDL 内部会比较，重复设置无开销
-
         const u32 t = SDL_GetTicks();
-        if (t - lastDraw < 16) return true;            // 重绘限到 ~60fps
+        if (t - lastDraw < 16) return true;       // 重绘限到 ~60fps
         lastDraw = t;
+        ui.tick(0.016);
 
-        const int active = int((t / 320) % 3);
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-        SDL_RenderClear(ren);
+        const int W = ui.width(), H = ui.height();
+        ui.clear(ui::theme::bg);
+        ui.gradientV(SDL_Rect{ 0, H - 320, W, 320 }, ui::rgba(8, 11, 16, 0), ui::theme::bgGlow);
+        ui.textCenter(ui::Font::Title, what, SDL_Rect{ 0, H / 2 - 70, W, 30 }, ui::theme::text);
+        ui.textCenter(ui::Font::Small, "按 Esc 取消，取消后将停留在单机模式",
+                      SDL_Rect{ 0, H / 2 - 32, W, 20 }, ui::theme::textFaint);
+        // 三个跳动的圆点表示「进行中」
         for (int i = 0; i < 3; ++i) {
-            const bool on = (i == active);
-            const int  sz = on ? 20 : 12;
-            const Uint8 v = on ? 235 : 70;
-            SDL_SetRenderDrawColor(ren, v, v, v, 255);
-            SDL_Rect r{ kScreenWidth / 2 + (i - 1) * 44 - sz / 2, kScreenHeight / 2 - sz / 2, sz, sz };
-            SDL_RenderFillRect(ren, &r);
+            const float phase = float(t) / 380.0f - float(i) * 0.28f;
+            const float k = std::max(0.0f, std::sin(phase * 3.14159f));
+            const int r = 5 + int(6.0f * k);
+            const ui::RGBA c = ui::mix(ui::theme::textFaint, ui::theme::accent, k);
+            const int cx = W / 2 + (i - 1) * 34;
+            const int cy = H / 2 + 26;
+            ui.round(SDL_Rect{ cx - r, cy - r, r * 2, r * 2 }, r, c);
         }
         SDL_RenderPresent(ren);
         return true;
     };
 
-    if (opt.host || opt.connect) {
+    // ------------------------------------------------------------ 联机
+    NetSession net;
+    opt.stateFile = cfg.rom + ".fcstate";
+
+    if (cfg.net != LaunchConfig::Net::Solo) {
         std::string err;
         bool ok = false;
-        if (opt.relay && !opt.delaySet) opt.delay = kRelayDefaultDelay;   // 中继多一跳，默认给足
+        if (cfg.relay && !opt.delaySet) cfg.delay = kRelayDefaultDelay;   // 中继多一跳，默认给足
 
-        if (opt.relay) {
+        if (cfg.relay) {
             RelayConfig rc;
-            rc.host = opt.relayIp;
-            rc.port = opt.relayPort;
-            rc.room = opt.room;
-            const std::string waitTitle =
-                "fc-emulator — 房间 " + opt.room + " 等待对端…（Esc 取消）";
+            rc.host = cfg.relayIp;
+            rc.port = u16(cfg.relayPort);
+            rc.room = cfg.room;
+            const std::string waitTitle = "房间 " + cfg.room + " 等待对端…";
             std::printf("模式    : %s（经中继 %s:%u，房间 %s），输入延迟 %d 帧\n",
-                        opt.host ? "主机" : "客机",
-                        opt.relayIp.c_str(), opt.relayPort, opt.room.c_str(), opt.delay);
+                        cfg.net == LaunchConfig::Net::Host ? "主机" : "客机",
+                        cfg.relayIp.c_str(), cfg.relayPort, cfg.room.c_str(), cfg.delay);
             std::printf("          本地无需放行端口；等待对端加入同一房间（按 Esc 取消）...\n");
             std::fflush(stdout);
-            ok = opt.host
-                ? net.startHostViaRelay(rc, opt.delay, &err,
-                                        [&] { return waitScreen(waitTitle.c_str()); })
-                : net.startClientViaRelay(rc, opt.delay, &err,
-                                          [&] { return waitScreen(waitTitle.c_str()); });
-        } else if (opt.host) {
-            std::printf("模式    : 主机，监听 0.0.0.0:%u，输入延迟 %d 帧\n", opt.hostPort, opt.delay);
+            ok = cfg.net == LaunchConfig::Net::Host
+                ? net.startHostViaRelay(rc, cfg.delay, &err, [&] { return waitScreen(waitTitle); })
+                : net.startClientViaRelay(rc, cfg.delay, &err, [&] { return waitScreen(waitTitle); });
+        } else if (cfg.net == LaunchConfig::Net::Host) {
+            std::printf("模式    : 主机，监听 0.0.0.0:%d，输入延迟 %d 帧\n", cfg.hostPort, cfg.delay);
             std::printf("          等待客机连接中（按 Esc 取消）...\n");
             std::fflush(stdout);
-            ok = net.startHost(opt.hostPort, opt.delay, &err,
-                               [&] { return waitScreen("fc-emulator — 等待客机连接中…（Esc 取消）"); });
+            ok = net.startHost(u16(cfg.hostPort), cfg.delay, &err,
+                               [&] { return waitScreen("等待客机连接中…"); });
         } else {
-            std::printf("模式    : 客机，连接 %s:%u，输入延迟 %d 帧\n",
-                        opt.hostIp.c_str(), opt.connectPort, opt.delay);
-            ok = net.startClient(opt.hostIp, opt.connectPort, opt.delay, &err,
-                                 [&] { return waitScreen("fc-emulator — 正在连接主机…（Esc 取消）"); });
+            std::printf("模式    : 客机，连接 %s:%d，输入延迟 %d 帧\n",
+                        cfg.hostIp.c_str(), cfg.connectPort, cfg.delay);
+            ok = net.startClient(cfg.hostIp, u16(cfg.connectPort), cfg.delay, &err,
+                                 [&] { return waitScreen("正在连接主机…"); });
         }
 
         if (!ok) {
-            // 取消（Esc）或超时：窗口已经开好了，直接切回单机继续玩，
-            // 而不是让用户白等一场再退出。
+            // 取消（Esc）或超时：直接切回单机继续玩，而不是让用户白等一场再退出。
             std::fprintf(stderr, "联机失败: %s\n", err.c_str());
-            if (opt.relay) {
+            if (cfg.relay) {
                 std::fprintf(stderr,
-                             "已切回单机模式。提示: ① 中继服务器需放行 UDP %u（不是 TCP）；"
-                             "② 两端 --room 必须完全一致；③ 房间号被别人占了就换一个。\n",
-                             opt.relayPort);
+                             "已切回单机模式。提示: ① 中继服务器需放行 UDP %d（不是 TCP）；"
+                             "② 两端房间号必须完全一致；③ 房间号被别人占了就换一个。\n",
+                             cfg.relayPort);
             } else {
                 std::fprintf(stderr, "已切回单机模式。提示: 主机需放行 UDP 端口；公网互联时需在主机做端口映射。\n");
             }
             net.stop();
-            SDL_SetWindowTitle(win, title.c_str());
+            cfg.net = LaunchConfig::Net::Solo;
             std::printf("模式    : 单机（联机未建立）\n");
         } else {
-            SDL_SetWindowTitle(win, title.c_str());
             if (net.relayed()) {
                 std::printf("联机    : 已连接（经中继 %s:%u，房间 %s），同步方式 %s\n",
                             net.relayConfig().host.c_str(), net.relayConfig().port,
@@ -411,7 +574,7 @@ int main(int argc, char** argv) {
                             net.peer().c_str(), net.strategy().name());
             }
             std::printf("延迟    : %d 帧\n", net.inputDelay());
-            std::printf("座位    : 你控制 %s；用本机键盘的 %s 键位（F2 可在单机时自定义）\n",
+            std::printf("座位    : 你控制 %s；用本机键盘的 %s 键位\n",
                         net.role() == NetSession::Role::Host ? "1P" : "2P",
                         net.role() == NetSession::Role::Host ? "P1" : "P2");
         }
@@ -422,7 +585,7 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------ 音频
     SDL_AudioDeviceID adev = 0;
     SDL_AudioSpec have{};
-    if (!opt.noAudio) {
+    if (cfg.audio) {
         SDL_AudioSpec want{};
         want.freq = 44100;
         want.format = AUDIO_S16SYS;
@@ -437,39 +600,18 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "音频设备打开失败: %s（已静音运行）\n", SDL_GetError());
         }
+    } else {
+        std::printf("音频    : 已关闭\n");
     }
 
     // ------------------------------------------------------------ 键位
     KeyMap keymap;
     keymap.setDefaults();
-    const std::string keyFile = opt.keyFile.empty() ? defaultKeyConfigPath() : opt.keyFile;
     if (keymap.load(keyFile)) {
         std::printf("键位    : 已从 %s 载入自定义设置\n", keyFile.c_str());
-        std::printf("          P1 方向=%s/%s/%s/%s  A=%s B=%s  选择=%s 开始=%s\n",
-                    keyName(keymap.get(0, ACT_UP)).c_str(), keyName(keymap.get(0, ACT_DOWN)).c_str(),
-                    keyName(keymap.get(0, ACT_LEFT)).c_str(), keyName(keymap.get(0, ACT_RIGHT)).c_str(),
-                    keyName(keymap.get(0, ACT_A)).c_str(), keyName(keymap.get(0, ACT_B)).c_str(),
-                    keyName(keymap.get(0, ACT_SELECT)).c_str(), keyName(keymap.get(0, ACT_START)).c_str());
-        std::printf("          该文件支持热加载：运行中改完保存，约 1 秒内自动生效\n");
     } else {
         std::printf("键位    : 使用默认（P1 = WASD + JK，P2 = 方向键 + Z/X）\n");
-        std::printf("          按 F2 可自定义，改完自动存到 %s（该文件运行中改动会热加载）\n",
-                    keyFile.c_str());
-    }
-
-    // 开发者自测：把键位设置界面渲染成一张图然后退出。
-    // 内置点阵字体是手写的，最容易出现「某个字母画错/整体错位」，需要能肉眼确认。
-    if (!opt.keyPreview.empty()) {
-        std::vector<u32> shot(kScreenPixels, 0);
-        KeyScreenView kv;
-        kv.fileTag = "fc-keys.cfg";
-        drawKeyConfigScreen(shot.data(), keymap, kv);
-        if (writePPM(opt.keyPreview, shot.data(), kScreenWidth, kScreenHeight))
-            std::printf("键位界面已导出: %s\n", opt.keyPreview.c_str());
-        else
-            std::fprintf(stderr, "导出键位界面失败: %s\n", opt.keyPreview.c_str());
-        SDL_Quit();
-        return 0;
+        std::printf("          在启动器或暂停菜单里可以自定义，改完自动存到 %s\n", keyFile.c_str());
     }
 
     // ------------------------------------------------------------ 手柄
@@ -484,21 +626,39 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------ 主循环
+    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                         SDL_TEXTUREACCESS_STREAMING, kScreenWidth, kScreenHeight);
+    if (!tex) {
+        std::fprintf(stderr, "创建纹理失败: %s\n", SDL_GetError());
+        for (SDL_GameController* gc : pads) SDL_GameControllerClose(gc);
+        if (adev) SDL_CloseAudioDevice(adev);
+        ui.shutdown(); SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit();
+        return 1;
+    }
+    SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+
     std::vector<u32> pixels(kScreenPixels, 0xFF000000u);
     std::vector<s16> samples;
     samples.reserve(8192);
 
     const u64 perfFreq = SDL_GetPerformanceFrequency();
-    u64 nextTick = SDL_GetPerformanceCounter();
+    u64 prevTick = SDL_GetPerformanceCounter();
+    u64 nextTick = prevTick;
 
     bool running = true;
-    bool fullscreen = opt.fullscreen;
+    bool fullscreen = opt.fullscreen || cfg.fullscreen;
+    if (fullscreen) SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+
+    int  curScale = cfg.scale;
+    bool menuOpen = false;
+    std::string menuToast;
+    bool   menuToastWarn = false;
+    double menuToastUntil = 0.0;
+
     u32 fpsT0 = SDL_GetTicks();
     int fpsFrames = 0, fps = 0;
     u32 titleT0 = SDL_GetTicks();
     bool netBroken = false;
-    u32 desyncFrame = 0xFFFFFFFFu;   // 首次不同步发生的帧号（用于标题栏定位）
-
     int  audioDrops = 0;             // 音频被丢弃的连续帧数（用于限频报警）
 
     // 键位配置热加载：记下「上次生效时的文件内容」，每秒比对一次。
@@ -508,23 +668,79 @@ int main(int argc, char** argv) {
     u32 keyWatchT0 = SDL_GetTicks();
     { std::vector<u8> raw; if (readFile(keyFile, raw)) keyCfgText.assign(raw.begin(), raw.end()); }
 
-    // 开发者自测：实测帧率（--fps-log），用来验证「联机不再比单机快」
     const u64 fpsLogT0 = SDL_GetPerformanceCounter();
     int fpsLogDone = 0;
 
+    // 打开 / 关闭暂停菜单时要清一次控件动画表，否则上次的悬停高亮会残留
+    auto setMenu = [&](bool open) {
+        menuOpen = open;
+        ui::resetAnimSteps();
+    };
+
     while (running) {
+        // ------------------------------------------------ 计时
+        const u64 nowT = SDL_GetPerformanceCounter();
+        double dt = double(nowT - prevTick) / double(perfFreq);
+        prevTick = nowT;
+        if (dt > 0.1) dt = 0.1;
+        ui.tick(dt);
+
+        // ------------------------------------------------ 输入快照
+        ui::Input in;
+        {
+            int mw = 0, mh = 0;
+            const Uint32 mstate = SDL_GetMouseState(&mw, &mh);
+            int ow = 0, ww = 0;
+            SDL_GetRendererOutputSize(ren, &ow, nullptr);
+            SDL_GetWindowSize(win, &ww, nullptr);
+            const float dpiK = (ww > 0) ? float(ow) / float(ww) : 1.0f;
+            in.mx = float(mw) * dpiK;
+            in.my = float(mh) * dpiK;
+            in.down = (mstate & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+        }
+
+        // ------------------------------------------------ 事件
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
                 case SDL_QUIT:
                     running = false;
                     break;
+
+                case SDL_WINDOWEVENT:
+                    if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                        ev.window.event == SDL_WINDOWEVENT_RESIZED) {
+                        int nw = 0, nh = 0;
+                        SDL_GetRendererOutputSize(ren, &nw, &nh);
+                        ui.setViewport(nw, nh);
+                        ui::resetAnimSteps();
+                    }
+                    break;
+
+                case SDL_MOUSEMOTION:
+                    in.mx = float(ev.motion.x);
+                    in.my = float(ev.motion.y);
+                    break;
+
+                case SDL_MOUSEBUTTONDOWN:
+                    if (ev.button.button == SDL_BUTTON_LEFT) {
+                        in.pressed = true;
+                        in.mx = float(ev.button.x);
+                        in.my = float(ev.button.y);
+                    }
+                    break;
+
+                case SDL_MOUSEWHEEL:
+                    in.wheel += float(ev.wheel.y);
+                    break;
+
                 case SDL_CONTROLLERDEVICEADDED:
                     if (SDL_IsGameController(ev.cdevice.which)) {
                         if (SDL_GameController* gc = SDL_GameControllerOpen(ev.cdevice.which))
                             pads.push_back(gc);
                     }
                     break;
+
                 case SDL_CONTROLLERDEVICEREMOVED: {
                     SDL_GameController* gc = SDL_GameControllerFromInstanceID(ev.cdevice.which);
                     if (gc) {
@@ -533,13 +749,62 @@ int main(int argc, char** argv) {
                     }
                     break;
                 }
-                case SDL_KEYDOWN:
-                    if (ev.key.keysym.sym == SDLK_F2) {
+
+                case SDL_KEYDOWN: {
+                    const SDL_Keycode k = ev.key.keysym.sym;
+
+                    if (k == SDLK_F1 || k == SDLK_ESCAPE) {
+                        setMenu(!menuOpen);
+                    } else if (k == SDLK_F11) {
+                        fullscreen = !fullscreen;
+                        SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    } else if (k == SDLK_F5) {
+                        // 存档只是「把当前状态读出来写盘」，不改变模拟状态，所以联机中也安全。
+                        std::vector<u8> buf;
+                        emu.saveState(buf);
+                        if (writeFile(opt.stateFile, buf)) {
+                            std::printf("[存档] %zu 字节 -> %s\n", buf.size(), opt.stateFile.c_str());
+                            menuToast = "已保存存档";
+                            menuToastWarn = false;
+                            menuToastUntil = double(SDL_GetTicks()) + 2200.0;
+                        }
+                    } else if (k == SDLK_F8) {
+                        if (net.active()) {
+                            // 锁步（feed-forward 帧同步）要求两端在同一帧上状态逐位一致。
+                            // 单方面 loadState 会立刻让本机状态偏离对端，且无法再自行收敛，
+                            // 所以这里必须拦住，而不是让它去触发一次「不同步」告警。
+                            std::fprintf(stderr,
+                                         "[读档] 联机中不能读档：锁步要求两端逐帧状态一致，"
+                                         "单方面读档会立刻不同步。\n"
+                                         "       需要读档请先在暂停菜单里退出联机，单机读完档再重新联机。\n");
+                            menuToast = "联机中不能读档";
+                            menuToastWarn = true;
+                            menuToastUntil = double(SDL_GetTicks()) + 2600.0;
+                        } else {
+                            std::vector<u8> buf;
+                            std::string why;
+                            if (readFile(opt.stateFile, buf) && emu.loadState(buf.data(), buf.size(), &why)) {
+                                std::printf("[读档] 成功（第 %llu 帧）\n",
+                                            (unsigned long long)emu.frameCount());
+                                menuToast = "已读取存档";
+                                menuToastWarn = false;
+                            } else {
+                                std::printf("[读档] 失败：%s\n",
+                                            why.empty() ? "读不到文件，先按 F5 存一个" : why.c_str());
+                                menuToast = why.empty() ? "没有可用的存档" : "读档失败";
+                                menuToastWarn = true;
+                            }
+                            menuToastUntil = double(SDL_GetTicks()) + 2200.0;
+                        }
+                    } else if (k == SDLK_F2) {
                         // 锁步联机时本机一停下来对端就会干等这一帧，所以联机中不开设置界面。
                         if (net.active()) {
                             std::fprintf(stderr,
                                          "[键位] 联机中不能打开键位设置（会让对端一直等帧）。"
                                          "请先退出联机、单机改好后再联机。\n");
+                            menuToast = "联机中不能改键位";
+                            menuToastWarn = true;
+                            menuToastUntil = double(SDL_GetTicks()) + 2600.0;
                         } else {
                             // 打开前先从磁盘重读：在外部编辑器手改过配置也能立刻看到最新值
                             {
@@ -548,120 +813,207 @@ int main(int argc, char** argv) {
                                 if (fresh.load(keyFile)) keymap = fresh;
                             }
                             bool keyQuit = false;
-                            runKeyConfigScreen(win, ren, keyFile, keymap, &keyQuit);
+                            runKeyConfigScreen(win, ren, ui, keyFile, keymap, &keyQuit);
                             if (keyQuit) running = false;
                             // 界面里可能刚存过盘，刷新基线内容，免得下一轮热加载又提示一次
                             {
                                 std::vector<u8> raw;
                                 if (readFile(keyFile, raw)) keyCfgText.assign(raw.begin(), raw.end());
                             }
+                            ui::resetAnimSteps();
                             titleT0 = 0;                  // 让标题栏立刻刷新
                         }
                     }
-                    else if (ev.key.keysym.sym == SDLK_ESCAPE) running = false;
-                    else if (ev.key.keysym.sym == SDLK_F11) {
-                        fullscreen = !fullscreen;
-                        SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-                    } else if (ev.key.keysym.sym == SDLK_F5) {
-                        // 存档只是「把当前状态读出来写盘」，不改变模拟状态，所以联机中也安全。
-                        std::vector<u8> buf;
-                        emu.saveState(buf);
-                        if (writeFile(opt.stateFile, buf)) {
-                            std::printf("[存档] %zu 字节 -> %s\n", buf.size(), opt.stateFile.c_str());
-                            if (net.active())
-                                std::printf("       注意: 联机中读档被禁用（会让两端状态分叉），"
-                                            "这个档请留到单机或退出联机后使用。\n");
-                        }
-                    } else if (ev.key.keysym.sym == SDLK_F8) {
-                        if (net.active()) {
-                            // 锁步（feed-forward 帧同步）要求两端在同一帧上状态逐位一致。
-                            // 单方面 loadState 会立刻让本机状态偏离对端，且无法再自行收敛，
-                            // 所以这里必须拦住，而不是让它去触发一次「不同步」告警。
-                            std::fprintf(stderr,
-                                         "[读档] 联机中不能读档：锁步要求两端逐帧状态一致，"
-                                         "单方面读档会立刻不同步。\n"
-                                         "       需要读档请先退出联机（Esc），单机读完档再重新联机。\n");
-                        } else {
-                            std::vector<u8> buf;
-                            std::string why;
-                            if (readFile(opt.stateFile, buf) && emu.loadState(buf.data(), buf.size(), &why))
-                                std::printf("[读档] 成功（第 %llu 帧）\n",
-                                            (unsigned long long)emu.frameCount());
-                            else
-                                std::printf("[读档] 失败：%s\n",
-                                            why.empty() ? "读不到文件，先按 F5 存一个" : why.c_str());
-                        }
-                    }
                     break;
+                }
+
                 default:
                     break;
             }
         }
         if (!running) break;
 
-        // 本机物理输入：两套键位（可自定义）+ 全部已连接手柄（手柄归入「本机玩家」那一路）
+        // ------------------------------------------------ 本机物理输入
+        // 两套键位（可自定义）+ 全部已连接手柄（手柄归入「本机玩家」那一路）
         u8 padBits = 0;
         for (SDL_GameController* gc : pads) padBits |= samplePad(gc);
 
-        u8 p1 = u8(keymap.sample(0) | padBits);     // 单机时的 1P；联机时即本机玩家输入
-        u8 p2 = keymap.sample(1);                   // 仅单机时使用（联机时由对端输入填充）
+        const u8 p1 = u8(keymap.sample(0) | padBits);   // 单机时的 1P；联机时即本机玩家输入
+        const u8 p2 = keymap.sample(1);                 // 仅单机时使用（联机时由对端输入填充）
         const u8 localPad = p1;
 
         const bool turbo = SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_TAB] != 0;
 
+        // 暂停只在单机成立：联机时停住会让对端一直等这一帧
+        const bool paused = menuOpen && !net.active();
+
         // ------------------------------------------------ 推进模拟
         bool simulated = false;
-        if (net.active()) {
-            // 锁步：等待远端延迟帧输入后再跑当前帧
-            const u32 simFrame = net.beginFrame(localPad);
-            if (net.disconnected()) {
-                std::fprintf(stderr, "\n[联机] 与 %s 的连接已断开，切回单机。\n", net.peer().c_str());
-                net.stop();
-                netBroken = true;
-            } else if (simFrame == NetSession::NO_FRAME) {
-                SDL_Delay(1);
-                continue;
-            } else {
-                // 座位固定：host 坐 1P、client 坐 2P，对端输入填另一路。
-                // 两端填完后各自看到的 P1/P2 完全镜像，所以状态哈希仍可逐位比对。
-                const u8 mine   = net.localInput(simFrame);
-                const u8 theirs = net.remoteInput(simFrame);
-                if (net.role() == NetSession::Role::Host) {
-                    emu.bus().player1().setButtons(mine);
-                    emu.bus().player2().setButtons(theirs);
+        bool waiting   = false;
+        if (!paused) {
+            if (net.active()) {
+                // 锁步：等待远端延迟帧输入后再跑当前帧
+                const u32 simFrame = net.beginFrame(localPad);
+                if (net.disconnected()) {
+                    std::fprintf(stderr, "\n[联机] 与 %s 的连接已断开，切回单机。\n", net.peer().c_str());
+                    net.stop();
+                    netBroken = true;
+                } else if (simFrame == NetSession::NO_FRAME) {
+                    // 对端还没到这一帧：本机先等，但界面照常刷新（菜单也还能点）
+                    waiting = true;
                 } else {
-                    emu.bus().player1().setButtons(theirs);
-                    emu.bus().player2().setButtons(mine);
+                    // 座位固定：host 坐 1P、client 坐 2P，对端输入填另一路。
+                    // 两端填完后各自看到的 P1/P2 完全镜像，所以状态哈希仍可逐位比对。
+                    const u8 mine   = net.localInput(simFrame);
+                    const u8 theirs = net.remoteInput(simFrame);
+                    if (net.role() == NetSession::Role::Host) {
+                        emu.bus().player1().setButtons(mine);
+                        emu.bus().player2().setButtons(theirs);
+                    } else {
+                        emu.bus().player1().setButtons(theirs);
+                        emu.bus().player2().setButtons(mine);
+                    }
+                    emu.runFrame();
+                    simulated = true;
+                    if ((simFrame % 120) == 0) net.sendHash(simFrame, emu.stateHash());
+                    // 只播报「新产生」的不同步，否则同一次不同步会每帧刷屏
+                    NetSession::DesyncInfo di;
+                    if (net.takeDesyncEvent(di)) {
+                        std::fprintf(stderr,
+                                     "\n[联机] 警告: 检测到状态不同步（可能 Mapper 或 ROM 版本不一致）\n"
+                                     "       帧 %u  本机 %016llX  对端 %016llX\n",
+                                     di.frame, (unsigned long long)di.local,
+                                     (unsigned long long)di.remote);
+                        menuToast = "检测到状态不同步";
+                        menuToastWarn = true;
+                        menuToastUntil = double(SDL_GetTicks()) + 4000.0;
+                    }
                 }
+            } else {
+                emu.bus().player1().setButtons(p1);
+                emu.bus().player2().setButtons(p2);
                 emu.runFrame();
                 simulated = true;
-                if ((simFrame % 120) == 0) net.sendHash(simFrame, emu.stateHash());
-                // 只播报「新产生」的不同步，否则同一次不同步会每帧刷屏
-                NetSession::DesyncInfo di;
-                if (net.takeDesyncEvent(di)) {
-                    std::fprintf(stderr,
-                                 "\n[联机] 警告: 检测到状态不同步（可能 Mapper 或 ROM 版本不一致）\n"
-                                 "       帧 %u  本机 %016llX  对端 %016llX\n",
-                                 di.frame, (unsigned long long)di.local,
-                                 (unsigned long long)di.remote);
-                }
+                if (turbo) { emu.bus().player1().setButtons(p2); emu.runFrame(); }
             }
-        } else {
-            emu.bus().player1().setButtons(p1);
-            emu.bus().player2().setButtons(p2);
-            emu.runFrame();
-            simulated = true;
-            if (turbo) { emu.bus().player1().setButtons(p2); emu.runFrame(); }
         }
-        if (!simulated) continue;
+        if (netBroken) { netBroken = false; }   // 已切回单机，正常继续
 
         // ------------------------------------------------ 画面
-        const u32* fb = emu.framebuffer();
-        for (int i = 0; i < kScreenPixels; ++i) pixels[size_t(i)] = 0xFF000000u | fb[i];
-        SDL_UpdateTexture(tex, nullptr, pixels.data(), kScreenWidth * 4);
-        SDL_RenderClear(ren);
-        SDL_RenderCopy(ren, tex, nullptr, nullptr);
-        SDL_RenderPresent(ren);
+        {
+            const SDL_Rect gr = gameRectFor(ui.width(), ui.height(), curScale);
+            if (simulated) {
+                const u32* fb = emu.framebuffer();
+                for (int i = 0; i < kScreenPixels; ++i) pixels[size_t(i)] = 0xFF000000u | fb[i];
+            }
+            ui.clear(ui::rgba(0, 0, 0));
+            SDL_UpdateTexture(tex, nullptr, pixels.data(), kScreenWidth * 4);
+            SDL_RenderCopy(ren, tex, nullptr, &gr);
+
+            if (menuOpen) {
+                PauseInfo pi;
+                pi.romName   = title;
+                pi.fps       = fps;
+                pi.netActive = net.active();
+                pi.netRelayed = net.relayed();
+                pi.desynced  = net.desynced();
+                if (net.active()) {
+                    pi.netTag = net.relayed()
+                        ? ("中继 · 房间 " + net.relayConfig().room)
+                        : std::string(netRoleName(net.role()));
+                    pi.lag   = net.lag();
+                    pi.delay = net.inputDelay();
+                }
+                pi.hasState   = fileExists(opt.stateFile);
+                pi.fullscreen = fullscreen;
+                pi.scale      = curScale;
+                pi.toast      = (double(SDL_GetTicks()) < menuToastUntil) ? menuToast : std::string();
+                pi.toastWarn  = menuToastWarn;
+
+                const PauseAction act = pauseMenuFrame(ui, pi, in, dt);
+                switch (act) {
+                    case PauseAction::Resume:
+                        setMenu(false);
+                        break;
+                    case PauseAction::SaveState: {
+                        std::vector<u8> buf;
+                        emu.saveState(buf);
+                        if (writeFile(opt.stateFile, buf)) {
+                            std::printf("[存档] %zu 字节 -> %s\n", buf.size(), opt.stateFile.c_str());
+                            menuToast = "已保存存档";
+                            menuToastWarn = false;
+                        } else {
+                            menuToast = "存档写入失败";
+                            menuToastWarn = true;
+                        }
+                        menuToastUntil = double(SDL_GetTicks()) + 2200.0;
+                        break;
+                    }
+                    case PauseAction::LoadState: {
+                        if (net.active()) {
+                            menuToast = "联机中不能读档";
+                            menuToastWarn = true;
+                        } else {
+                            std::vector<u8> buf;
+                            std::string why;
+                            if (readFile(opt.stateFile, buf) && emu.loadState(buf.data(), buf.size(), &why)) {
+                                std::printf("[读档] 成功（第 %llu 帧）\n",
+                                            (unsigned long long)emu.frameCount());
+                                menuToast = "已读取存档";
+                                menuToastWarn = false;
+                            } else {
+                                std::printf("[读档] 失败：%s\n", why.c_str());
+                                menuToast = why.empty() ? "没有可用的存档" : "读档失败";
+                                menuToastWarn = true;
+                            }
+                        }
+                        menuToastUntil = double(SDL_GetTicks()) + 2200.0;
+                        break;
+                    }
+                    case PauseAction::KeyConfig: {
+                        if (net.active()) {
+                            menuToast = "联机中不能改键位";
+                            menuToastWarn = true;
+                            menuToastUntil = double(SDL_GetTicks()) + 2600.0;
+                        } else {
+                            KeyMap fresh;
+                            fresh.setDefaults();
+                            if (fresh.load(keyFile)) keymap = fresh;
+                            bool keyQuit = false;
+                            runKeyConfigScreen(win, ren, ui, keyFile, keymap, &keyQuit);
+                            {
+                                std::vector<u8> raw;
+                                if (readFile(keyFile, raw)) keyCfgText.assign(raw.begin(), raw.end());
+                            }
+                            ui::resetAnimSteps();
+                            prevTick = SDL_GetPerformanceCounter();   // 别把停留时间算进 dt
+                            if (keyQuit) running = false;
+                        }
+                        break;
+                    }
+                    case PauseAction::ToggleFullscreen:
+                        fullscreen = !fullscreen;
+                        SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                        ui::resetAnimSteps();
+                        break;
+                    case PauseAction::CycleScale:
+                        curScale = nextScale(curScale);
+                        break;
+                    case PauseAction::Quit:
+                        running = false;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            SDL_RenderPresent(ren);
+        }
+
+        // 等对端时不消耗帧预算（否则等待期间会白算掉节拍、越等越晚），但要先把画面刷出去
+        if (waiting) {
+            SDL_Delay(1);
+            continue;
+        }
 
         // ------------------------------------------------ 音频
         if (adev) {
@@ -685,7 +1037,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ------------------------------------------------ 节流
+        // ------------------------------------------------ 帧率统计
         fpsFrames++;
         if (SDL_GetTicks() - fpsT0 >= 1000) {
             fps = fpsFrames;
@@ -693,7 +1045,8 @@ int main(int argc, char** argv) {
             fpsT0 = SDL_GetTicks();
         }
 
-        // 帧节拍：单机和联机都必须节流。
+        // ------------------------------------------------ 帧节拍
+        // 单机和联机都必须节流。
         //
         // 曾经的写法是「联机时跳过节流，反正锁步等待会自行节流」—— 这是错的：
         // 输入延迟锁步只提供「上限」约束（本机不会跑到对端前面），不提供「节奏」约束。
@@ -701,8 +1054,7 @@ int main(int argc, char** argv) {
         // waitForRemote() 立刻返回、根本不等，于是模拟就以 CPU 能跑多快跑多快 ——
         // 表现就是「联机比单机快很多」。所以联机也要按 kFrameMs 打拍子。
         //
-        // 注意节拍点只推进「真正跑了一帧」的路径（NO_FRAME 的等待分支会 continue，
-        // 不消耗节拍），否则等待期间会白算掉帧预算、越等越晚。
+        // 暂停时同样要打拍子（否则暂停期间的 dt 会累积成一大坨，恢复时一顿猛跑）。
         {
             const u64 now = SDL_GetPerformanceCounter();
             // Tab 加速只在单机生效：联机时钟必须两端一致，本机抢跑没有意义（会被对端拖住）
@@ -732,15 +1084,6 @@ int main(int argc, char** argv) {
                         keymap = fresh;
                         keyCfgText = txt;
                         std::printf("[键位] 检测到 %s 有改动，已热加载生效\n", keyFile.c_str());
-                        std::printf("       P1 方向=%s/%s/%s/%s  A=%s B=%s  选择=%s 开始=%s\n",
-                                    keyName(keymap.get(0, ACT_UP)).c_str(),
-                                    keyName(keymap.get(0, ACT_DOWN)).c_str(),
-                                    keyName(keymap.get(0, ACT_LEFT)).c_str(),
-                                    keyName(keymap.get(0, ACT_RIGHT)).c_str(),
-                                    keyName(keymap.get(0, ACT_A)).c_str(),
-                                    keyName(keymap.get(0, ACT_B)).c_str(),
-                                    keyName(keymap.get(0, ACT_SELECT)).c_str(),
-                                    keyName(keymap.get(0, ACT_START)).c_str());
                         std::fflush(stdout);
                     } else {
                         std::fprintf(stderr, "[键位] %s 有改动但解析失败，继续沿用当前键位\n",
@@ -770,26 +1113,24 @@ int main(int argc, char** argv) {
                     ? ("中继·房间 " + net.relayConfig().room)
                     : std::string(netRoleName(net.role()));
                 char des[40] = "";
-                if (net.desynced()) {
-                    if (desyncFrame == 0xFFFFFFFFu) std::snprintf(des, sizeof(des), "  [不同步!]");
-                    else std::snprintf(des, sizeof(des), "  [不同步@帧%u]", desyncFrame);
-                }
+                if (net.desynced()) std::snprintf(des, sizeof(des), "  [不同步!]");
                 std::snprintf(buf, sizeof(buf), "%s  |  FPS %d  |  %s %s lag %d  delay %d%s",
                               title.c_str(), fps, tag.c_str(),
                               net.role() == NetSession::Role::Host ? "(1P)" : "(2P)",
                               net.lag(), net.inputDelay(), des);
             } else {
-                std::snprintf(buf, sizeof(buf), "%s  |  FPS %d  |  单机", title.c_str(), fps);
+                std::snprintf(buf, sizeof(buf), "%s  |  FPS %d  |  单机  |  Esc 菜单",
+                              title.c_str(), fps);
             }
             SDL_SetWindowTitle(win, buf);
         }
     }
 
-    if (netBroken) { /* 已切回单机 */ }
     net.stop();
     for (SDL_GameController* gc : pads) SDL_GameControllerClose(gc);
     if (adev) SDL_CloseAudioDevice(adev);
     SDL_DestroyTexture(tex);
+    ui.shutdown();
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();

@@ -20,6 +20,19 @@ find_library(FC_SDL2_LIB SDL2
     HINTS "${FC_SDL2_ROOT}/lib"
     NO_DEFAULT_PATH)
 
+# ---------------------------------------------------------------- SDL2_ttf
+# 界面层用它渲染矢量字体（系统微软雅黑），Windows 版的 dll 已经把
+# freetype/harfbuzz 静态链进去了，所以运行时只需要 SDL2_ttf.dll 这一个额外文件。
+set(FC_SDL2_TTF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL2_ttf-2.24.0/x86_64-w64-mingw32"
+    CACHE PATH "SDL2_ttf 开发包根目录（包含 include/SDL2、lib、bin）")
+
+find_path(FC_SDL2_TTF_INCLUDE SDL_ttf.h
+    HINTS "${FC_SDL2_TTF_ROOT}/include/SDL2" "${FC_SDL2_TTF_ROOT}/include"
+    NO_DEFAULT_PATH)
+find_library(FC_SDL2_TTF_LIB SDL2_ttf
+    HINTS "${FC_SDL2_TTF_ROOT}/lib"
+    NO_DEFAULT_PATH)
+
 # ---------------------------------------------------------------- 模拟器核心（不含前端）
 set(FC_CORE_SOURCES
     src/core/cpu6502.cpp
@@ -55,25 +68,31 @@ if(MINGW)
 endif()
 
 # ---------------------------------------------------------------- SDL2 图形前端
-if(FC_SDL2_INCLUDE AND FC_SDL2_LIB)
+if(FC_SDL2_INCLUDE AND FC_SDL2_LIB AND FC_SDL2_TTF_INCLUDE AND FC_SDL2_TTF_LIB)
     add_executable(fc-emulator
         src/frontend/main.cpp
+        src/frontend/ui.cpp
+        src/frontend/launcher.cpp
+        src/frontend/pausemenu.cpp
         src/frontend/keycfg.cpp
         src/frontend/keyscreen.cpp)
-    target_include_directories(fc-emulator PRIVATE ${FC_SDL2_INCLUDE})
-    target_link_libraries(fc-emulator PRIVATE fc-core ${FC_SDL2_LIB})
+    target_include_directories(fc-emulator PRIVATE ${FC_SDL2_INCLUDE} ${FC_SDL2_TTF_INCLUDE})
+    # 顺序要紧：SDL2_ttf 依赖 SDL2，必须排在前面
+    target_link_libraries(fc-emulator PRIVATE fc-core ${FC_SDL2_TTF_LIB} ${FC_SDL2_LIB})
 
     if(WIN32)
         add_custom_command(TARGET fc-emulator POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${FC_SDL2_ROOT}/bin/SDL2.dll" "$<TARGET_FILE_DIR:fc-emulator>"
-            COMMENT "复制 SDL2.dll 到输出目录")
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${FC_SDL2_TTF_ROOT}/bin/SDL2_ttf.dll" "$<TARGET_FILE_DIR:fc-emulator>"
+            COMMENT "复制 SDL2.dll / SDL2_ttf.dll 到输出目录")
     endif()
 else()
     message(WARNING
-        "未找到 SDL2（查找路径: ${FC_SDL2_ROOT}）。"
+        "未找到 SDL2 或 SDL2_ttf（SDL2: ${FC_SDL2_ROOT} / SDL2_ttf: ${FC_SDL2_TTF_ROOT}）。"
         "将只构建 fc-headless。"
-        "请解压 SDL2 开发包到 third_party/ 或用 -DFC_SDL2_ROOT=<路径> 指定。")
+        "请把两个开发包解压到 third_party/，或用 -DFC_SDL2_ROOT= / -DFC_SDL2_TTF_ROOT= 指定。")
 endif()
 
 # ---------------------------------------------------------------- 编译选项
