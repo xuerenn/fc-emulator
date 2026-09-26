@@ -1,0 +1,47 @@
+# ==============================================================================
+#  fc-emulator — 文本与二进制属性
+#
+#  这是 Windows / MinGW 项目，但可能被 Linux 服务器上的人 clone（比如部署 fc-relay）。
+#  不把行尾策略写死，才能避免「文件在 Windows 上是 CRLF、到 Linux 上 commit
+#  变成整文件 diff」这种经典事故。
+# ==============================================================================
+
+# 默认：交给 git 自动判断。工作区保持原样（Windows 上仍是 CRLF），
+# 但入库统一存成 LF，跨平台 diff 才不会整篇飘红。
+* text=auto
+
+# --- 明确按文本处理并入库为 LF ---
+*.c      text eol=lf
+*.h      text eol=lf
+*.cpp    text eol=lf
+*.hpp    text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+*.cmake  text eol=lf
+CMakeLists.txt text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# --- Windows 批处理必须是 CRLF，否则 cmd 解析会出问题 ---
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+
+# --- 二进制：禁止任何行尾转换与 diff ---
+*.nes        binary
+*.fcstate    binary
+*.png        binary
+*.ppm        binary
+*.ico        binary
+*.zip        binary
+*.gz         binary
+*.tar        binary
+*.exe        binary
+*.dll        binary
+*.a          binary
+*.lib        binary
+*.obj        binary
+
+# --- 语言统计：把文档从「代码」里摘出去，不让 README 撑爆代码量 ---
+README.md    linguist-documentation
+NOTICE.md    linguist-documentation
