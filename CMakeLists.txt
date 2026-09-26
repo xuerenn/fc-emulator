@@ -33,6 +33,32 @@ find_library(FC_SDL2_TTF_LIB SDL2_ttf
     HINTS "${FC_SDL2_TTF_ROOT}/lib"
     NO_DEFAULT_PATH)
 
+# ---------------------------------------------------------------- zlib
+# 只用来解 zip 里的 .nes（src/frontend/zipfile.cpp）。
+# MinGW-w64 自带 zlib，Linux/macOS 上一般也预装。
+find_package(ZLIB QUIET)
+
+if(NOT ZLIB_FOUND)
+    # CMake 自带的 FindZLIB 只搜标准安装前缀，不会去翻编译器自带的 sysroot，
+    # 而 MinGW-w64 恰恰把 zlib 放在那里（<mingw>/x86_64-w64-mingw32/{include,lib}）。
+    # 所以再按编译器自己的搜索路径兜一次 —— 找不到也不报错，只是少了 zip 支持。
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -print-file-name=libz.a
+                    OUTPUT_VARIABLE _fc_libz
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(_fc_libz AND EXISTS "${_fc_libz}")
+        get_filename_component(_fc_libz_dir "${_fc_libz}" DIRECTORY)
+        find_path(_fc_zlib_include zlib.h
+            HINTS "${_fc_libz_dir}/../include" "${_fc_libz_dir}/../../include")
+        if(_fc_zlib_include)
+            set(ZLIB_FOUND      TRUE)
+            set(ZLIB_LIBRARIES  "${_fc_libz}")
+            set(ZLIB_INCLUDE_DIRS "${_fc_zlib_include}")
+            message(STATUS "使用编译器自带的 zlib: ${_fc_libz}")
+        endif()
+    endif()
+endif()
+
 # ---------------------------------------------------------------- 模拟器核心（不含前端）
 set(FC_CORE_SOURCES
     src/core/cpu6502.cpp
@@ -75,10 +101,19 @@ if(FC_SDL2_INCLUDE AND FC_SDL2_LIB AND FC_SDL2_TTF_INCLUDE AND FC_SDL2_TTF_LIB)
         src/frontend/launcher.cpp
         src/frontend/pausemenu.cpp
         src/frontend/keycfg.cpp
-        src/frontend/keyscreen.cpp)
+        src/frontend/keyscreen.cpp
+        src/frontend/zipfile.cpp)   # 总是编译：没有 zlib 时仍能读「不压缩」的 zip 条目
     target_include_directories(fc-emulator PRIVATE ${FC_SDL2_INCLUDE} ${FC_SDL2_TTF_INCLUDE})
     # 顺序要紧：SDL2_ttf 依赖 SDL2，必须排在前面
     target_link_libraries(fc-emulator PRIVATE fc-core ${FC_SDL2_TTF_LIB} ${FC_SDL2_LIB})
+    if(ZLIB_FOUND)
+        # ZLIB_LIBRARIES 是 find_package(ZLIB) 给出来的实际库路径（MinGW 下就是 libz.a）
+        target_link_libraries(fc-emulator PRIVATE ${ZLIB_LIBRARIES})
+        target_compile_definitions(fc-emulator PRIVATE FC_HAVE_ZLIB=1)
+        target_include_directories(fc-emulator PRIVATE ${ZLIB_INCLUDE_DIRS})
+    else()
+        message(WARNING "未找到 zlib，将不支持直接加载 .zip（裸 .nes 不受影响）。")
+    endif()
 
     if(WIN32)
         add_custom_command(TARGET fc-emulator POST_BUILD
@@ -100,6 +135,10 @@ if(MSVC)
     target_compile_options(fc-core PRIVATE /W3)
 else()
     target_compile_options(fc-core PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    # 前端也要开：不然「构建零告警」只是一句没被验证过的声明
+    target_compile_options(fc-emulator PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(fc-headless PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(fc-relay    PRIVATE -Wall -Wextra -Wno-unused-parameter)
     if(MINGW)
         target_link_options(fc-core PUBLIC -static-libgcc -static-libstdc++)
     endif()

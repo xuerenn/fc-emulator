@@ -12,6 +12,7 @@
 #include "core/cartridge.h"
 #include "keycfg.h"
 #include "keyscreen.h"
+#include "zipfile.h"
 
 #include <algorithm>
 #include <cctype>
@@ -88,6 +89,55 @@ std::string parentPath(const std::string& p) {
     return s.substr(0, i);
 }
 
+// "N:" / "N:\" / "N:/" 都算盘符根（手输路径时多打几个斜杠很常见，
+// 所以先把尾部斜杠统统剥掉再判断）。到这一层再往上就该去「此电脑」了。
+bool isDriveRoot(const std::string& p) {
+    std::string s = p;
+    while (s.size() > 2 && (s.back() == '\\' || s.back() == '/')) s.pop_back();
+    return s.size() == 2 && s[1] == ':';
+}
+
+// 从路径栏粘进来的东西常常带引号和空白（资源管理器「复制地址」就会加引号）
+std::string trimPath(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == ' ' || s[a] == '\t')) ++a;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) --b;
+    std::string r = s.substr(a, b - a);
+    if (r.size() >= 2 && r.front() == '"' && r.back() == '"') r = r.substr(1, r.size() - 2);
+    return r;
+}
+
+// 「此电脑」要列的东西：本机所有盘符。这是「只能从 exe 目录一路向上」的解药 ——
+// 卡带放在别的盘上时，以前的界面根本走不到那里去。
+std::vector<std::string> listDrives() {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    const DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if ((mask & (DWORD(1) << i)) == 0) continue;
+        std::string d;
+        d += char('A' + i);
+        d += ":\\";
+        out.push_back(d);
+    }
+#else
+    out.push_back("/");
+#endif
+    return out;
+}
+
+// 盘符可用空间。拿不到就返回 -1（界面上只显示「驱动器」，不编数字）。
+long long diskFreeBytes(const std::string& drive) {
+#ifdef _WIN32
+    ULARGE_INTEGER avail{};
+    if (!GetDiskFreeSpaceExW(toWide(drive).c_str(), &avail, nullptr, nullptr)) return -1;
+    return (long long)avail.QuadPart;
+#else
+    (void)drive;
+    return -1;
+#endif
+}
+
 std::string fileNameOf(const std::string& p) {
     const size_t i = p.find_last_of("\\/");
     return (i == std::string::npos) ? p : p.substr(i + 1);
@@ -135,23 +185,84 @@ long long fileSize(const std::string& p) {
 
 std::string humanSize(long long n) {
     char b[64];
-    if (n >= 1024LL * 1024)      std::snprintf(b, sizeof(b), "%.1f MB", double(n) / 1048576.0);
-    else if (n >= 1024)          std::snprintf(b, sizeof(b), "%lld KB", (long long)(n / 1024));
-    else                         std::snprintf(b, sizeof(b), "%lld B", n);
+    // 盘符可用空间会到 TB 级，所以往上多铺两档
+    if (n >= 1024LL * 1024 * 1024 * 1024)
+        std::snprintf(b, sizeof(b), "%.2f TB", double(n) / 1099511627776.0);
+    else if (n >= 1024LL * 1024 * 1024)
+        std::snprintf(b, sizeof(b), "%.1f GB", double(n) / 1073741824.0);
+    else if (n >= 1024LL * 1024)
+        std::snprintf(b, sizeof(b), "%.1f MB", double(n) / 1048576.0);
+    else if (n >= 1024)
+        std::snprintf(b, sizeof(b), "%lld KB", (long long)(n / 1024));
+    else
+        std::snprintf(b, sizeof(b), "%lld B", n);
     return b;
 }
 
-bool isNesFile(const std::string& name) {
-    if (name.size() < 4) return false;
-    std::string e = name.substr(name.size() - 4);
-    for (char& c : e) c = char(std::tolower((unsigned char)c));
-    return e == ".nes";
+bool hasExt(const std::string& name, const char* ext) {
+    const size_t n = std::strlen(ext);
+    if (name.size() <= n) return false;
+    std::string tail = name.substr(name.size() - n);
+    for (char& c : tail) c = char(std::tolower((unsigned char)c));
+    return tail == ext;
+}
+
+bool isNesFile(const std::string& name) { return hasExt(name, ".nes"); }
+bool isZipFile(const std::string& name) { return hasExt(name, ".zip"); }
+
+// 启动器认得的「卡带来源」：裸 ROM，或装着 ROM 的 zip
+bool isRomFile(const std::string& name) { return isNesFile(name) || isZipFile(name); }
+
+// ---------------------------------------------------------------- zip 解压缓存
+//
+// 选 zip 时把里面的 .nes 解出来落到这个目录，再把 rom 指向解压结果 ——
+// 下游（载入、存档、联机指纹比对）完全不需要知道 zip 的存在。
+//
+// 为什么缓存键要包含「压缩包绝对路径 + 包内条目名」而不是用时间戳/随机名：
+// 存档文件是按 ROM 路径命名的（<rom>.fcstate）。缓存路径必须**每次运行都一样**，
+// 否则这次解出来的档下次就找不到了。
+
+std::string romCacheDir() {
+#ifdef _WIN32
+    return exeDir() + "\\romcache";
+#else
+    return exeDir() + "/romcache";
+#endif
+}
+
+bool ensureDir(const std::string& p) {
+    if (isDirectory(p)) return true;
+#ifdef _WIN32
+    return CreateDirectoryW(toWide(p).c_str(), nullptr) != 0;
+#else
+    return ::mkdir(p.c_str(), 0755) == 0;
+#endif
+}
+
+uint64_t fnv1a64(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+std::string zipCachePath(const std::string& zipPath, const std::string& entryName) {
+    const uint64_t h = fnv1a64(zipPath + "::" + entryName);
+    char name[64];
+    std::snprintf(name, sizeof(name), "%016llx.nes", (unsigned long long)h);
+#ifdef _WIN32
+    return romCacheDir() + "\\" + name;
+#else
+    return romCacheDir() + "/" + name;
+#endif
 }
 
 struct DirEntry {
     std::string name;
     bool        isDir = false;
     long long   size  = 0;
+    // 只有 zip 用得上的懒加载字段：包内有几个 ROM（-1 = 还没算过）。
+    // 解析中央目录要读整个目录区，列表每帧对每个 zip 重算一遍太亏，所以缓存下来。
+    int         zipRoms = -1;
 };
 
 std::vector<DirEntry> listDir(const std::string& path) {
@@ -570,6 +681,20 @@ void chip(Ui& u, int x, int y, const std::string& text, const RGBA& fg, const RG
     u.textCenter(Font::Small, text, r, fg);
 }
 
+// 可点击的小胶囊。和 chip() 的区别是会跟着鼠标变色、并报告是否被点中，
+// 用来在压缩包内多个 ROM 之间切换（合卡合集很常见）。
+bool pickChip(Ui& u, const Frame& in, double dt, const std::string& id,
+              const SDL_Rect& r, const std::string& text, bool on) {
+    const bool  hot = in.inside(r);
+    const float k   = animStep("pc:" + id, hot, dt);
+    const float o   = animStep("pco:" + id, on, dt);
+    const RGBA  bg  = mix(mix(theme::surface, theme::hover, k), fade(theme::accent, 0.20f), o);
+    u.round(r, radius::Chip, bg);
+    if (o > 0.02f) u.roundOutline(r, radius::Chip, 1, fade(theme::accent, 0.75f * o));
+    u.textCenter(Font::Small, text, r, mix(mix(theme::textDim, theme::text, k), theme::text, o));
+    return hot && in.pressed;
+}
+
 // 按可用宽度折行（按字符断，对中英混排够用）
 std::vector<std::string> wrapText(Ui& u, Font role, const std::string& text, int maxW) {
     std::vector<std::string> lines;
@@ -623,6 +748,9 @@ struct State {
     std::string infoFor;      // info 对应哪个文件，避免重复解析
     RomInfo     info;
 
+    std::string zipPath;      // zip 对应哪个压缩包，避免每帧重读中央目录
+    ZipInfo     zip;
+
     TextField fHostIp, fHostPort, fConnectPort, fRelayIp, fRelayPort, fRoom;
 
     std::string toast;
@@ -634,6 +762,10 @@ struct State {
 
     bool draggingDelay = false;   // 输入延迟滑杆是否正在拖动
     float settingsScroll = 0;     // 设置页滚动位置（内容比一屏高时才用得上）
+
+    // 文件浏览器
+    bool      driveView = false;  // 正在显示「此电脑」（驱动器列表）而不是某个目录
+    TextField fPath;              // 路径栏；点一下就地编辑，回车跳转（任意盘符都行）
 };
 
 void toast(State& st, const std::string& msg, bool warn = false) {
@@ -681,6 +813,8 @@ bool LaunchConfig::save(const std::string& path) const {
     std::fprintf(f, "# fc-emulator 启动器配置（程序自动维护，可手改）\n");
     writeKV(f, "rom",         rom);
     writeKV(f, "browseDir",   browseDir);
+    writeKV(f, "romZip",      romZip);
+    writeKV(f, "romZipEntry", romZipEntry);
     writeKV(f, "net",         std::to_string(int(net)));
     writeKV(f, "relay",       relay ? "1" : "0");
     writeKV(f, "hostIp",      hostIp);
@@ -699,43 +833,62 @@ bool LaunchConfig::save(const std::string& path) const {
     return true;
 }
 
-bool LaunchConfig::load(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    std::string k, v;
-    while (readKV(f, k, v)) {
-        if (k.empty()) continue;
-        if      (k == "rom")         rom = v;
-        else if (k == "browseDir")   browseDir = v;
-        else if (k == "net")         net = Net(std::atoi(v.c_str()));
-        else if (k == "relay")       relay = (v == "1");
-        else if (k == "hostIp")      hostIp = v;
-        else if (k == "hostPort")    hostPort = std::atoi(v.c_str());
-        else if (k == "connectPort") connectPort = std::atoi(v.c_str());
-        else if (k == "relayIp")     relayIp = v;
-        else if (k == "relayPort")   relayPort = std::atoi(v.c_str());
-        else if (k == "room")        room = v;
-        else if (k == "delay")       delay = std::atoi(v.c_str());
-        else if (k == "loadState")   loadState = v;
-        else if (k == "scale")       scale = std::atoi(v.c_str());
-        else if (k == "fullscreen")  fullscreen = (v == "1");
-        else if (k == "audio")       audio = (v == "1");
-        else if (k == "keyFile")     keyFile = v;
-    }
-    std::fclose(f);
+// 单个字段赋值。抽出来是为了让「读配置文件」和「命令行 --cfg-set 覆盖」共用同一套语义，
+// 免得出现「配置文件里 delay 会被夹到 0..30、命令行给的值却不会」这种两套规则。
+// 返回 false 表示不认识这个键（load 里静默跳过，--cfg-set 里报错）。
+bool LaunchConfig::setField(const std::string& k, const std::string& v) {
+    if (k.empty()) return false;
+    if      (k == "rom")         rom = v;
+    else if (k == "browseDir")   browseDir = v;
+    else if (k == "romZip")      romZip = v;
+    else if (k == "romZipEntry") romZipEntry = v;
+    else if (k == "net")         net = Net(std::atoi(v.c_str()));
+    else if (k == "relay")       relay = (v == "1");
+    else if (k == "hostIp")      hostIp = v;
+    else if (k == "hostPort")    hostPort = std::atoi(v.c_str());
+    else if (k == "connectPort") connectPort = std::atoi(v.c_str());
+    else if (k == "relayIp")     relayIp = v;
+    else if (k == "relayPort")   relayPort = std::atoi(v.c_str());
+    else if (k == "room")        room = v;
+    else if (k == "delay")       delay = std::atoi(v.c_str());
+    else if (k == "loadState")   loadState = v;
+    else if (k == "scale")       scale = std::atoi(v.c_str());
+    else if (k == "fullscreen")  fullscreen = (v == "1");
+    else if (k == "audio")       audio = (v == "1");
+    else if (k == "keyFile")     keyFile = v;
+    else return false;
+    return true;
+}
+
+void LaunchConfig::clamp() {
     if (hostPort <= 0 || hostPort > 65535)       hostPort = 7777;
     if (connectPort <= 0 || connectPort > 65535) connectPort = 7777;
     if (relayPort <= 0 || relayPort > 65535)     relayPort = 7777;
     if (delay < 0) delay = 0;
     if (delay > 30) delay = 30;
     if (room.empty()) room = "7777";
+}
+
+bool LaunchConfig::load(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::string k, v;
+    while (readKV(f, k, v)) setField(k, v);
+    std::fclose(f);
+    clamp();
     return true;
 }
 
 bool LaunchConfig::validate(std::string* why) const {
     if (rom.empty()) { if (why) *why = "还没有选择 ROM"; return false; }
     if (!fileExists(rom)) { if (why) *why = "ROM 文件不存在：\n" + rom; return false; }
-    if (!isNesFile(rom)) { if (why) *why = "只支持 .nes 文件"; return false; }
+    if (!isNesFile(rom)) {
+        // 走到这里说明 rom 还没被解析成真正的 .nes：要么是用户手改配置写了个 zip 而解压失败，
+        // 要么是选了别的格式。两种情况给的原因不一样，别混成一句"只支持 .nes"。
+        if (why) *why = isZipFile(rom) ? "压缩包里没能取出 ROM，换个压缩包或先手动解压"
+                                       : "只支持 .nes，或装着 .nes 的 .zip";
+        return false;
+    }
     if (net != Net::Solo) {
         if (relay) {
             if (relayIp.empty()) { if (why) *why = "中继地址不能为空"; return false; }
@@ -798,8 +951,12 @@ void drawBottomBar(View& v, bool* wantStart) {
 
     LaunchConfig& cfg = *v.cfg;
 
-    // 左侧：当前选择摘要
-    const std::string romName = cfg.rom.empty() ? "未选择 ROM" : fileNameOf(cfg.rom);
+    // 左侧：当前选择摘要。zip 来源时要显示包内那条 ROM 的名字 ——
+    // 底下的 rom 是缓存文件（16 位十六进制名），给人看没有意义。
+    const std::string romName = cfg.rom.empty()
+                              ? std::string("未选择 ROM")
+                              : (cfg.romZip.empty() ? fileNameOf(cfg.rom)
+                                                    : fileNameOf(cfg.romZipEntry));
     u.textVCenter(Font::Body, u.clip(Font::Body, romName, W - 480), kPad, SDL_Rect{ 0, y + 16, 0, 22 },
                   cfg.rom.empty() ? theme::textFaint : theme::text);
 
@@ -807,6 +964,7 @@ void drawBottomBar(View& v, bool* wantStart) {
     if (cfg.net == LaunchConfig::Net::Host)        mode = cfg.relay ? "主机 · 经中继" : "主机 · 直连";
     else if (cfg.net == LaunchConfig::Net::Client) mode = cfg.relay ? "客机 · 经中继" : "客机 · 直连";
     std::string sub = "模式：" + mode;
+    if (!cfg.romZip.empty())    sub += " · 来自 " + fileNameOf(cfg.romZip);
     if (!cfg.loadState.empty()) sub += " · 启动时读档";
     u.text(Font::Small, sub, kPad, y + 44, theme::textFaint);
 
@@ -827,23 +985,38 @@ void drawBottomBar(View& v, bool* wantStart) {
 namespace {
 
 void refreshEntries(State& st) {
-    st.entries = listDir(st.browseDir);
-    // 启动器只关心目录和 .nes。build 目录这类地方会混进 .png/.o/.fcstate，
-    // 全列出来会把真正要找的 ROM 淹掉，所以这里直接过滤掉。
-    st.entries.erase(std::remove_if(st.entries.begin(), st.entries.end(),
-                                    [](const DirEntry& e) {
-                                        return !e.isDir && !isNesFile(e.name);
-                                    }),
-                     st.entries.end());
+    if (st.driveView) {
+        // 「此电脑」：条目名本身就是完整路径（"C:\"），点一下直接进去
+        st.entries.clear();
+        for (const std::string& d : listDrives()) {
+            DirEntry e;
+            e.name  = d;
+            e.isDir = true;
+            e.size  = diskFreeBytes(d);
+            st.entries.push_back(e);
+        }
+    } else {
+        st.entries = listDir(st.browseDir);
+        // 启动器只关心目录、.nes 和 .zip。build 目录这类地方会混进 .png/.o/.fcstate，
+        // 全列出来会把真正要找的 ROM 淹掉，所以这里直接过滤掉。
+        st.entries.erase(std::remove_if(st.entries.begin(), st.entries.end(),
+                                        [](const DirEntry& e) {
+                                            return !e.isDir && !isRomFile(e.name);
+                                        }),
+                         st.entries.end());
+    }
     st.sel      = -1;
     st.scroll   = st.scrollTo = 0;
     st.info     = RomInfo{};
     st.infoFor.clear();
+    st.zipPath.clear();
+    st.zip = ZipInfo{};
 }
 
 // 换目录 / 重新扫描后调用：把当前选中的 ROM 重新定位出来，省得用户再找一遍
 void reloadDir(State& st, const LaunchConfig& cfg) {
     refreshEntries(st);
+    if (st.driveView) return;          // 「此电脑」里没有 ROM 可定位
     const std::string target = cfg.rom.empty() ? std::string() : fileNameOf(cfg.rom);
     if (target.empty()) return;
     for (size_t i = 0; i < st.entries.size(); ++i) {
@@ -854,14 +1027,192 @@ void reloadDir(State& st, const LaunchConfig& cfg) {
     }
 }
 
-void ensureInfo(State& st) {
-    if (st.sel < 0 || size_t(st.sel) >= st.entries.size()) return;
-    const DirEntry& e = st.entries[size_t(st.sel)];
-    if (e.isDir) return;
-    const std::string full = joinPath(st.browseDir, e.name);
+// 进入「此电脑」。驱动器列表是唯一能跨越盘符的入口。
+void enterDriveView(State& st) {
+    st.driveView = true;
+    refreshEntries(st);
+}
+
+// 跳到任意目录。路径可以不来自当前盘 —— 这正是「自选卡带目录」的核心。
+void goToDir(State& st, const LaunchConfig& cfg, const std::string& path) {
+    if (!isDirectory(path)) {
+        toast(st, "目录不存在：" + path, true);
+        return;
+    }
+    st.driveView = false;
+    st.browseDir = path;
+    reloadDir(st, cfg);
+}
+
+// 详情卡的 ROM 概要。以「真正要载入的那个文件」为准 ——
+// zip 的话就是解压出来的那份缓存，而不是压缩包本体。
+void ensureInfoFor(State& st, const std::string& full) {
+    if (full.empty()) return;
     if (st.infoFor == full) return;
     st.info    = inspectRom(full);
     st.infoFor = full;
+}
+
+// 把 zip 里的某个条目解到缓存目录，并把它设为当前 ROM。
+// 失败只提示、不改动现有选择（否则一次误点就把已经选好的卡带弄丢了）。
+bool useZipRom(State& st, LaunchConfig& cfg, const std::string& zipPath,
+               const ZipEntryInfo& entry, bool* wantStart) {
+    const std::string out = zipCachePath(zipPath, entry.name);
+    if (!ensureDir(romCacheDir())) {
+        toast(st, "建不出缓存目录，无法解压：" + romCacheDir(), true);
+        return false;
+    }
+    // 先写临时文件再改名：中途失败也不会留下一个半截的 .nes
+    // 冒充"可用卡带"（那会让存档和指纹比对拿到错的东西）。
+    const std::string tmp = out + ".tmp";
+    std::string err;
+    if (!zipExtractTo(zipPath, entry, tmp, &err)) {
+        std::remove(tmp.c_str());
+        toast(st, "解压失败：" + err, true);
+        return false;
+    }
+    std::remove(out.c_str());
+    if (std::rename(tmp.c_str(), out.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        toast(st, "无法写入解压结果：" + out, true);
+        return false;
+    }
+
+    std::printf("[zip] %s :: %s  ->  %s\n", fileNameOf(zipPath).c_str(),
+                entry.name.c_str(), out.c_str());
+
+    const bool switched = (cfg.rom != out);
+    cfg.rom         = out;
+    cfg.romZip      = zipPath;
+    cfg.romZipEntry = entry.name;
+    if (switched) cfg.loadState.clear();   // 换了卡带，之前那个档多半对不上了
+    if (wantStart) *wantStart = true;
+    return true;
+}
+
+// 选中一个文件。双击时把 wantStart 置位，等于「点两下直接开跑」。
+// 必须等列表遍历结束之后再调用（见 drawLibrary 里那段说明）。
+void pickRom(State& st, LaunchConfig& cfg, const std::string& name, bool* wantStart) {
+    if (!isRomFile(name)) {
+        toast(st, "只能载入 .nes 或 .zip", true);
+        return;
+    }
+    const std::string full = joinPath(st.browseDir, name);
+    // 按名字重新定位下标：调用点可能是刚重建过的列表，旧下标未必还对得上
+    for (size_t i = 0; i < st.entries.size(); ++i) {
+        if (!st.entries[i].isDir && st.entries[i].name == name) { st.sel = int(i); break; }
+    }
+
+    if (isZipFile(name)) {
+        const ZipInfo zi = zipOpen(full);
+        if (!zi.ok) {
+            toast(st, "压缩包打不开：" + zi.err, true);
+            return;
+        }
+        if (zi.roms.empty()) {
+            toast(st, "压缩包里没有 .nes 文件", true);
+            return;
+        }
+        // 沿用上次在同一包里选过的那一条；没有就取第一条。
+        // 包里有多条时，详情卡会列出全部供切换（见 drawDetail）。
+        const ZipEntryInfo* pick = &zi.roms.front();
+        for (const ZipEntryInfo& r : zi.roms)
+            if (r.name == cfg.romZipEntry) pick = &r;
+        useZipRom(st, cfg, full, *pick, wantStart);
+        return;
+    }
+
+    cfg.rom = full;
+    cfg.romZip.clear();
+    cfg.romZipEntry.clear();
+    if (wantStart) *wantStart = true;
+}
+
+// 键盘上下移动光标时同步详情栏。只跟着「文件」动，不跟着目录动 ——
+// 方向键一路扫过去会把用户带进一堆子目录里，那不是他要的。
+void syncCursorToView(State& st, LaunchConfig& cfg) {
+    if (st.driveView) return;
+    if (st.sel < 0 || size_t(st.sel) >= st.entries.size()) return;
+    const DirEntry& e = st.entries[size_t(st.sel)];
+    if (e.isDir) return;
+    pickRom(st, cfg, e.name, nullptr);
+}
+
+// 详情卡要用到的「当前 zip 的中央目录」。包大时解析不便宜，所以按路径缓存一份。
+void ensureZipInfo(State& st, const std::string& zipPath) {
+    if (zipPath.empty()) {
+        st.zipPath.clear();
+        st.zip = ZipInfo{};
+        return;
+    }
+    if (st.zipPath == zipPath) return;
+    st.zipPath = zipPath;
+    st.zip     = zipOpen(zipPath);
+}
+
+// 配置是从磁盘读回来的，可能已经过时：
+//   · rom 记的是 zip 解压出来的缓存，而缓存被清掉了（换了机器、清了 exe 目录）
+//   · 或者配置被人手改成 rom=xxx.zip
+// 这两种情况都在这里补上，而不是让用户对着"ROM 文件不存在"发懵。
+void resolveZipRom(LaunchConfig& cfg, std::string* warn) {
+    auto note = [&](const std::string& s) { if (warn) *warn = s; };
+
+    // 情况 A：rom 直接就是 zip（手改的配置，或早期版本的写法）
+    if (isZipFile(fileNameOf(cfg.rom)) && fileExists(cfg.rom)) {
+        const ZipInfo zi = zipOpen(cfg.rom);
+        if (!zi.ok || zi.roms.empty()) {
+            note("压缩包打不开或里面没有 .nes：" + fileNameOf(cfg.rom));
+            return;
+        }
+        const ZipEntryInfo* pick = &zi.roms.front();
+        for (const ZipEntryInfo& r : zi.roms)
+            if (r.name == cfg.romZipEntry) pick = &r;
+        cfg.romZip      = cfg.rom;
+        cfg.romZipEntry = pick->name;
+        cfg.rom.clear();                 // 交给下面的统一流程去解压
+    }
+
+    if (cfg.romZip.empty()) return;
+
+    if (!fileExists(cfg.romZip)) {
+        note("找不到来源压缩包：" + fileNameOf(cfg.romZip));
+        cfg.romZip.clear();
+        cfg.romZipEntry.clear();
+        cfg.rom.clear();
+        return;
+    }
+    // 缓存还在就直接用（存档也挂在它旁边，路径必须保持一致）
+    if (isNesFile(fileNameOf(cfg.rom)) && fileExists(cfg.rom)) return;
+
+    const ZipInfo zi = zipOpen(cfg.romZip);
+    if (!zi.ok) {
+        note("压缩包打不开：" + zi.err);
+        cfg.rom.clear();
+        cfg.romZip.clear();
+        return;
+    }
+    const ZipEntryInfo* pick = nullptr;
+    for (const ZipEntryInfo& r : zi.roms)
+        if (r.name == cfg.romZipEntry) pick = &r;
+    if (!pick) {
+        note("压缩包里找不到上次那个 ROM：" + cfg.romZipEntry);
+        cfg.rom.clear();
+        return;
+    }
+    if (!ensureDir(romCacheDir())) {
+        note("建不出缓存目录：" + romCacheDir());
+        cfg.rom.clear();
+        return;
+    }
+    const std::string out = zipCachePath(cfg.romZip, pick->name);
+    std::string err;
+    if (!zipExtractTo(cfg.romZip, *pick, out, &err)) {
+        note("解压失败：" + err);
+        cfg.rom.clear();
+        return;
+    }
+    std::printf("[zip] 重新解压 %s :: %s\n", fileNameOf(cfg.romZip).c_str(), pick->name.c_str());
+    cfg.rom = out;
 }
 
 void fitScroll(View& v, int listH, int itemH) {
@@ -892,16 +1243,41 @@ void drawLibrary(View& v, bool* wantStart) {
     // 路径行
     const SDL_Rect pathRow{ listCard.x + 14, listCard.y + 14, listCard.w - 28, 34 };
     {
+        // 上一级；到盘符根就转去「此电脑」
         const SDL_Rect upBtn{ pathRow.x, pathRow.y, 34, 34 };
-        if (button(u, v.F(), v.dt, "up", upBtn, "↑", BtnStyle::Subtle)) {
-            const std::string p = parentPath(st.browseDir);
-            if (!p.empty() && p != st.browseDir) {
-                st.browseDir = p;
-                reloadDir(st, cfg);
+        if (button(u, v.F(), v.dt, "up", upBtn, "↑", BtnStyle::Subtle, !st.driveView)) {
+            if (isDriveRoot(st.browseDir)) {
+                enterDriveView(st);
+            } else {
+                const std::string p = parentPath(st.browseDir);
+                if (!p.empty() && p != st.browseDir) goToDir(st, cfg, p);
+                else                                 enterDriveView(st);
             }
         }
-        u.textVCenter(Font::Small, u.clip(Font::Small, st.browseDir, pathRow.w - 46),
-                      pathRow.x + 42, pathRow, theme::textDim);
+
+        // 「此电脑」快捷入口：卡带放在别的盘上时，这是唯一能过去的门
+        const SDL_Rect pcBtn{ pathRow.x + pathRow.w - 76, pathRow.y, 76, 34 };
+        if (button(u, v.F(), v.dt, "pc", pcBtn, "此电脑", BtnStyle::Subtle, !st.driveView))
+            enterDriveView(st);
+
+        // 中间是可编辑的路径栏：点一下就地改，回车跳转（支持直接粘贴任意绝对路径）
+        const SDL_Rect pathArea{ pathRow.x + 40, pathRow.y, pathRow.w - 40 - 84, pathRow.h };
+        if (st.fPath.focused) {
+            textField(u, v.F(), st.fPath, pathArea, "输入任意目录，例如 D:\\roms", false);
+        } else {
+            const std::string shown = st.driveView ? std::string("此电脑") : st.browseDir;
+            const bool hot = v.F().inside(pathArea);
+            const float k  = animStep("pathhot", hot, v.dt);
+            if (k > 0.01f) u.round(pathArea, radius::Input, fade(theme::text, 0.05f * k));
+            u.textVCenter(Font::Small, u.clip(Font::Small, shown, pathArea.w - 12),
+                          pathArea.x + 6, pathArea,
+                          st.driveView ? theme::textFaint : mix(theme::textDim, theme::text, k));
+            if (v.F().pressed && hot) {
+                st.fPath.text    = st.driveView ? std::string() : st.browseDir;
+                st.fPath.cursor  = st.fPath.text.size();
+                st.fPath.focused = true;
+            }
+        }
     }
 
     // 列表
@@ -915,22 +1291,36 @@ void drawLibrary(View& v, bool* wantStart) {
     const int last  = std::min(int(st.entries.size()), first + listArea.h / itemH + 2);
 
     if (st.entries.empty()) {
-        u.textCenter(Font::Small, "这个目录里没有可显示的内容",
+        u.textCenter(Font::Small, st.driveView ? "没有检测到可用的盘符" : "这个目录里没有可显示的内容",
                      SDL_Rect{ listArea.x, listArea.y + listArea.h / 2 - 20, listArea.w, 20 },
                      theme::textFaint);
-        u.textCenter(Font::Small, "把 .nes 文件拖进窗口也可以直接载入",
+        u.textCenter(Font::Small, "把 .nes / .zip 拖进窗口也可以直接载入",
                      SDL_Rect{ listArea.x, listArea.y + listArea.h / 2 + 2, listArea.w, 20 },
                      theme::textFaint);
     }
 
+    // ---------------------------------------------------------------- 列表项
+    // 点击**不能**在循环里就地执行：进目录会重建 st.entries，而本次迭代的边界（last）
+    // 和引用（e）都还指着旧的那一份，就地改会立刻越界读。
+    // 曾因此在 build/CMakeFiles/3.21.2 这类「进去之后条目更少」的目录上闪退
+    // （std::bad_alloc / SIGSEGV，取决于越界读到的垃圾内存长什么样）。
+    // 所以这里只记录意图，等循环结束、旧引用彻底失效之后再执行。
+    enum class RowAct { None, Enter, Pick };
+    RowAct      rowAct = RowAct::None;
+    std::string rowName;
+    bool        rowDbl = false;
+
     for (int i = first; i < last; ++i) {
-        const DirEntry& e = st.entries[size_t(i)];
+        DirEntry& e = st.entries[size_t(i)];   // 非 const：zip 的「包内几个 ROM」是懒加载的
         const SDL_Rect r{ listArea.x + 2, listArea.y + int(float(i) * itemH - st.scroll) + 2,
                           listArea.w - 4, itemH - 4 };
         const bool on  = (i == st.sel);
         const bool hot = v.F().inside(r);
-        const float k  = animStep("row:" + st.browseDir + ":" + e.name, hot, v.dt);
-        const float onK = animStep("rowsel:" + st.browseDir + ":" + e.name, on, v.dt);
+        // 动画 id 必须带来源前缀：只按 name 做键的话，
+        // 「此电脑」里的 C:\ 和别的目录里叫同一个名字的条目会互相串动画
+        const std::string animKey = (st.driveView ? "pc:" : st.browseDir + ":") + e.name;
+        const float k  = animStep("row:" + animKey, hot, v.dt);
+        const float onK = animStep("rowsel:" + animKey, on, v.dt);
 
         RGBA bg = mix(rgba(0, 0, 0, 0), fade(theme::text, 0.05f), k);
         bg = mix(bg, fade(theme::accent, 0.16f), onK);
@@ -938,50 +1328,80 @@ void drawLibrary(View& v, bool* wantStart) {
         if (onK > 0.02f) u.roundOutline(r, radius::Button, 1, fade(theme::accent, 0.6f * onK));
 
         // 图标
-        if (e.isDir) {
+        if (st.driveView) {                       // 驱动器：一个硬盘盒子
+            const SDL_Rect dr{ r.x + 13, r.y + 16, 26, 22 };
+            u.round(dr, 4, theme::textDim);
+            u.round(SDL_Rect{ dr.x + 4, dr.y + 13, 18, 5 }, 2, theme::surface);
+            u.round(SDL_Rect{ dr.x + 5, dr.y + 4, 16, 4 }, 2, fade(theme::surface, 0.7f));
+        } else if (e.isDir) {                     // 文件夹
             const SDL_Rect fr{ r.x + 14, r.y + 18, 22, 16 };
             u.round(SDL_Rect{ fr.x, fr.y - 5, 10, 7 }, 2, theme::warn);
             u.round(fr, 4, theme::warn);
-        } else {
-            const bool nes = isNesFile(e.name);
+        } else {                                  // 卡带（zip 用绿色区分）
+            const bool z = isZipFile(e.name);
             cartridgeIcon(u, SDL_Rect{ r.x + 14, r.y + 13, 24, 30 },
-                          nes ? theme::accent : theme::border,
-                          nes ? rgba(10, 20, 32) : theme::surface);
+                          z ? theme::ok : theme::accent,
+                          z ? rgba(12, 30, 22) : rgba(10, 20, 32));
         }
 
         const int tx = r.x + 52;
         const int maxW = r.w - 52 - 12;
-        u.text(Font::Body, u.clip(Font::Body, e.isDir ? e.name : stripExt(e.name), maxW),
+        // 标题：驱动器去掉尾部反斜杠；.nes 去掉扩展名（列表里全是卡带，留着只是噪音）；
+        // .zip 保留，因为「这是个压缩包」本身就是需要一眼看到的信息
+        std::string shown;
+        if (st.driveView) {
+            shown = e.name;
+            while (!shown.empty() && (shown.back() == '\\' || shown.back() == '/')) shown.pop_back();
+        } else if (e.isDir) {
+            shown = e.name;
+        } else {
+            shown = isZipFile(e.name) ? e.name : stripExt(e.name);
+        }
+        u.text(Font::Body, u.clip(Font::Body, shown, maxW),
                tx, r.y + 10, on ? theme::text : mix(theme::textDim, theme::text, k));
 
-        std::string sub = e.isDir ? "文件夹" : humanSize(e.size);
-        if (!e.isDir && !isNesFile(e.name)) sub += " · 非 .nes";
-        if (!e.isDir && isNesFile(e.name) && fileExists(joinPath(st.browseDir, e.name) + ".fcstate"))
-            sub += " · 有存档";
+        std::string sub;
+        if (st.driveView) {
+            sub = (e.size >= 0) ? ("驱动器 · 可用 " + humanSize(e.size)) : "驱动器";
+        } else if (e.isDir) {
+            sub = "文件夹";
+        } else {
+            sub = humanSize(e.size);
+            if (isZipFile(e.name)) {
+                if (e.zipRoms == -1) {                   // 第一次画到它时才算
+                    const ZipInfo zi = zipOpen(joinPath(st.browseDir, e.name));
+                    e.zipRoms = zi.ok ? int(zi.roms.size()) : -2;   // -2 = 解析失败
+                }
+                if (e.zipRoms == -2)     sub += " · 压缩包（无法解析）";
+                else if (e.zipRoms == 0) sub += " · 压缩包里没有 .nes";
+                else if (e.zipRoms == 1) sub += " · 压缩包内有 1 个 ROM";
+                else                     sub += " · 压缩包内有 " + std::to_string(e.zipRoms) + " 个 ROM";
+            }
+            if (isNesFile(e.name) && fileExists(joinPath(st.browseDir, e.name) + ".fcstate"))
+                sub += " · 有存档";
+        }
         u.text(Font::Small, u.clip(Font::Small, sub, maxW), tx, r.y + 32,
                on ? theme::textDim : theme::textFaint);
 
-        // 交互
+        // 交互：只记录意图，真正的动作放在循环外（见上方说明）
         if (hot && v.F().pressed) {
             const double now = double(SDL_GetTicks());
-            const bool dbl = (now - st.lastClickT < 420.0) && std::fabs(v.F().my - st.lastClickY) < 6.0f;
+            rowDbl  = (now - st.lastClickT < 420.0) && std::fabs(v.F().my - st.lastClickY) < 6.0f;
             st.lastClickT = now;
             st.lastClickY = v.F().my;
-
-            if (e.isDir) {
-                st.browseDir = joinPath(st.browseDir, e.name);
-                reloadDir(st, cfg);
-            } else if (isNesFile(e.name)) {
-                st.sel = i;
-                v.cfg->rom = joinPath(st.browseDir, e.name);
-                ensureInfo(st);
-                if (dbl) *wantStart = true;
-            } else {
-                toast(st, "只能载入 .nes 文件", true);
-            }
+            rowName = e.name;
+            rowAct  = e.isDir ? RowAct::Enter : RowAct::Pick;
         }
     }
     SDL_RenderSetClipRect(u.ren(), nullptr);
+
+    if (rowAct == RowAct::Enter) {
+        // 「此电脑」里条目名本身就是完整路径（"C:\"），直接进去；
+        // 普通目录才需要拼当前路径。
+        goToDir(st, cfg, st.driveView ? rowName : joinPath(st.browseDir, rowName));
+    } else if (rowAct == RowAct::Pick) {
+        pickRom(st, cfg, rowName, rowDbl ? wantStart : nullptr);
+    }
 
     // 滚动条
     if (int(st.entries.size()) * itemH > listArea.h) {
@@ -999,28 +1419,40 @@ void drawLibrary(View& v, bool* wantStart) {
 
     if (!hasRom) {
         u.textCenter(Font::Title, "选择左侧的 ROM 开始",
-                     SDL_Rect{ detailCard.x, detailCard.y + detailCard.h / 2 - 60, detailCard.w, 30 },
+                     SDL_Rect{ detailCard.x, detailCard.y + detailCard.h / 2 - 80, detailCard.w, 30 },
                      theme::textDim);
-        u.textCenter(Font::Small, "支持 iNES / NES2.0 格式的 .nes 文件",
-                     SDL_Rect{ detailCard.x, detailCard.y + detailCard.h / 2 - 24, detailCard.w, 20 },
+        u.textCenter(Font::Small, "支持 .nes，也支持直接选装着 .nes 的 .zip",
+                     SDL_Rect{ detailCard.x, detailCard.y + detailCard.h / 2 - 44, detailCard.w, 20 },
                      theme::textFaint);
         u.textCenter(Font::Small, "Mapper 支持：NROM · MMC1 · UxROM · CNROM · BMC-68in1",
-                     SDL_Rect{ detailCard.x, detailCard.y + detailCard.h / 2 + 4, detailCard.w, 20 },
+                     SDL_Rect{ detailCard.x, detailCard.y + detailCard.h / 2 - 16, detailCard.w, 20 },
+                     theme::textFaint);
+        u.textCenter(Font::Small, "左侧路径栏可以直接点开，输入任意目录（含其它盘符）回车跳转",
+                     SDL_Rect{ detailCard.x, detailCard.y + detailCard.h / 2 + 16, detailCard.w, 20 },
                      theme::textFaint);
         return;
     }
 
-    ensureInfo(st);
+    ensureInfoFor(st, cfg.rom);
+    ensureZipInfo(st, cfg.romZip);
     const RomInfo& info = st.info;
     const int cx = detailCard.x + 28;
     int y = detailCard.y + 28;
 
-    cartridgeIcon(u, SDL_Rect{ cx, y, 62, 76 }, theme::accent, rgba(10, 20, 32));
+    cartridgeIcon(u, SDL_Rect{ cx, y, 62, 76 }, cfg.romZip.empty() ? theme::accent : theme::ok,
+                  rgba(10, 20, 32));
 
     const int ttx = cx + 82;
     const int tmaxW = detailCard.w - 28 - 82 - 20;
-    u.text(Font::Title, u.clip(Font::Title, stripExt(fileNameOf(cfg.rom)), tmaxW), ttx, y + 6, theme::text);
-    u.text(Font::Small, "iNES / NES2.0", ttx, y + 36, theme::textFaint);
+    // zip 来源时标题用包内那条 ROM 的名字，比缓存文件的 16 位十六进制名可读得多
+    const std::string title = cfg.romZip.empty()
+                            ? stripExt(fileNameOf(cfg.rom))
+                            : stripExt(fileNameOf(cfg.romZipEntry));
+    u.text(Font::Title, u.clip(Font::Title, title, tmaxW), ttx, y + 6, theme::text);
+    u.text(Font::Small, cfg.romZip.empty()
+                            ? "iNES / NES2.0"
+                            : u.clip(Font::Small, "来自 " + fileNameOf(cfg.romZip), tmaxW),
+               ttx, y + 36, theme::textFaint);
 
     // 状态标签
     if (!info.valid)          chip(u, ttx, y + 58, "文件头异常", theme::err, fade(theme::err, 0.16f));
@@ -1064,13 +1496,48 @@ void drawLibrary(View& v, bool* wantStart) {
         }
     } else {
         u.text(Font::Small, "尚无存档", cx, y, theme::textFaint);
-        u.text(Font::Small, "游戏中按 F5 存档，文件名与 ROM 同名（.fcstate）",
+        // 存档是靠「ROM 路径 + .fcstate」命名的。裸 ROM 时文件名一眼能对上，
+        // 但 zip 载入时 ROM 路径指向的是缓存文件，档名会是一串哈希 ——
+        // 照直说「与 ROM 同名」会让人去别处找，所以这里换个说法。
+        u.text(Font::Small, cfg.romZip.empty()
+                                ? "游戏中按 F5 存档，文件名与 ROM 同名（.fcstate）"
+                                : "游戏中按 F5 存档，档存在外面的 romcache 缓存目录里",
                cx, y + 22, theme::textFaint);
     }
 
-    // 路径
-    u.text(Font::Small, u.clip(Font::Small, cfg.rom, detailCard.w - 56),
-           cx, detailCard.y + detailCard.h - 34, theme::textFaint);
+    // ---------------- 压缩包内的其它 ROM
+    // 一个 zip 里塞好几个 ROM 是很常见的（合卡合集、按机种分文件夹）。
+    // 这里把同包的其它条目也列出来，点一下就地切换 —— 不必回列表再点一次。
+    if (!cfg.romZip.empty() && st.zip.ok && st.zip.roms.size() > 1) {
+        const int zy = detailCard.y + detailCard.h - 104;
+        u.text(Font::Small,
+               "这个压缩包里还有 " + std::to_string(st.zip.roms.size() - 1) + " 个 ROM，点一下切换：",
+               cx, zy, theme::textFaint);
+
+        const int chipY = zy + 22;
+        int cxp = cx;
+        const int right = detailCard.x + detailCard.w - 28;
+        for (const ZipEntryInfo& ze : st.zip.roms) {
+            const std::string label = fileNameOf(ze.name);
+            const int w = std::min(230, u.measure(Font::Small, label) + 26);
+            if (cxp + w > right) {                       // 一行放不下就不再往下画
+                u.text(Font::Small, "…", cxp + 2, chipY + 6, theme::textFaint);
+                break;
+            }
+            if (pickChip(u, v.F(), v.dt, cfg.romZip + ":" + ze.name,
+                         SDL_Rect{ cxp, chipY, w, 28 }, label, ze.name == cfg.romZipEntry)) {
+                useZipRom(st, cfg, cfg.romZip, ze, nullptr);
+            }
+            cxp += w + 8;
+        }
+    }
+
+    // 路径（zip 来源时把「包 → 解压结果」两段都写出来，便于排查）
+    const std::string where = cfg.romZip.empty()
+                            ? cfg.rom
+                            : cfg.romZip + "  →  " + cfg.rom;
+    u.text(Font::Small, u.clip(Font::Small, where, detailCard.w - 56),
+           cx, detailCard.y + detailCard.h - 30, theme::textFaint);
 }
 
 } // namespace
@@ -1198,13 +1665,23 @@ void drawNetplay(View& v) {
         fill.w = int(float(track.w) * float(cfg.delay) / 30.0f);
         u.round(fill, 3, theme::accent);
 
-        // 拖动：按下时命中就接管，直到松开为止（这样拖出滑杆范围也不会断）
+        // 拖动：按下即接管，松开才释放（拖出滑杆范围也不会断）。
+        //
+        // 顺序很关键，写成「先置位、再按 !down 清位」是错的：
+        // 那一帧如果 down 还是 false（按下事件刚发生、状态查询还没跟上），
+        // 清位行紧跟着就把置位行抹掉了，此后 pressed 变 false 再也无法重新置位 ——
+        // 表现就是「按住拖完全没反应」。所以先处理释放，再处理按下。
         const SDL_Rect hit{ track.x - 12, track.y - 16, track.w + 24, 40 };
-        if (v.F().pressed && v.F().inside(hit)) st.draggingDelay = true;
-        if (!v.F().down) st.draggingDelay = false;
-        if (st.draggingDelay && v.F().down) {
+        auto delayFromMouse = [&] {
             const float t = float(v.F().mx - float(track.x)) / float(std::max(1, track.w));
-            cfg.delay = std::max(0, std::min(30, int(t * 30.0f + 0.5f)));
+            return std::max(0, std::min(30, int(t * 30.0f + 0.5f)));
+        };
+        if (!v.F().down) st.draggingDelay = false;
+        if (v.F().pressed && v.F().inside(hit)) {
+            st.draggingDelay = true;
+            cfg.delay = delayFromMouse();     // 点轨道任意位置直接跳过去，不必先抓住手柄
+        } else if (st.draggingDelay) {
+            cfg.delay = delayFromMouse();
         }
         const int hx = track.x + int(float(track.w) * float(cfg.delay) / 30.0f) - 9;
         u.shadow(SDL_Rect{ hx, track.y - 6, 18, 18 }, 9, 6, 160);
@@ -1394,6 +1871,13 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
     cfg.browseDir = st.browseDir;
     reloadDir(st, cfg);
 
+    // 上次选的是 zip 里的 ROM 的话，把解压缓存补齐（见 resolveZipRom）
+    {
+        std::string zw;
+        resolveZipRom(cfg, &zw);
+        if (!zw.empty()) toast(st, zw, true);
+    }
+
     bool running = true;
     bool wantStart = false;
     bool wantKeyEditor = false;
@@ -1413,17 +1897,18 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
         ui.tick(dt);
 
         // ---------------- 输入快照
+        // 注意顺序：**先轮询事件，再取鼠标状态**。
+        // 反过来写的话，按下那一帧的 SDL_MOUSEBUTTONDOWN 还没被处理，
+        // SDL_GetMouseState 会返回「还没按下」，于是 down=false 与 pressed=true 同时成立。
+        // 滑杆就栽在这上面：它当时是「先按 pressed 置位、再按 !down 清位」，
+        // 清位行紧跟在置位行后面，按下那一帧就把自己抹掉了，之后 pressed 变 false
+        // 再也无法重新置位 —— 表现就是「拖不动」。
         Frame in;
-        int mw = 0, mh = 0;
-        Uint32 mstate = SDL_GetMouseState(&mw, &mh);
         int ow = 0, oh = 0, ww = 0, wh = 0;
         SDL_GetRendererOutputSize(ren, &ow, &oh);
         SDL_GetWindowSize(win, &ww, &wh);
-        // 高 DPI 下渲染坐标与窗口坐标不是 1:1，转一下鼠标位置
+        // 高 DPI 下渲染坐标与窗口坐标不是 1:1，鼠标位置要乘这个系数才能和界面矩形对上
         const float dpiK = (ww > 0) ? float(ow) / float(ww) : 1.0f;
-        in.mx = float(mw) * dpiK;
-        in.my = float(mh) * dpiK;
-        in.down = (mstate & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
 
         // ---------------- 事件
         SDL_Event e;
@@ -1461,6 +1946,7 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                     break;
 
                 case SDL_TEXTINPUT:
+                    textFieldInput(st.fPath, e);
                     textFieldInput(st.fHostIp, e);
                     textFieldInput(st.fHostPort, e);
                     textFieldInput(st.fConnectPort, e);
@@ -1473,22 +1959,28 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                     const std::string dropped = e.drop.file ? e.drop.file : "";
                     if (e.drop.file) SDL_free(e.drop.file);
                     if (!dropped.empty()) {
+                        st.tab = Tab::Library;
                         if (isDirectory(dropped)) {
-                            st.browseDir  = dropped;
-                            cfg.browseDir = dropped;
-                            reloadDir(st, cfg);
-                        } else if (isNesFile(dropped)) {
-                            cfg.rom       = dropped;
-                            st.browseDir  = parentPath(dropped);
+                            goToDir(st, cfg, dropped);
                             cfg.browseDir = st.browseDir;
+                            toast(st, "已切换到 " + dropped);
+                        } else if (isRomFile(dropped)) {
+                            // 拖文件进来时把浏览器一并切到它所在目录，
+                            // 否则详情栏显示的东西和左侧列表对不上。
+                            cfg.rom = dropped;
+                            cfg.romZip.clear();
+                            cfg.romZipEntry.clear();
+                            const std::string dir = parentPath(dropped);
+                            if (!dir.empty() && isDirectory(dir)) {
+                                st.driveView  = false;
+                                st.browseDir  = dir;
+                                cfg.browseDir = dir;
+                            }
                             reloadDir(st, cfg);
-                            const std::string nm = fileNameOf(dropped);
-                            for (size_t i = 0; i < st.entries.size(); ++i)
-                                if (!st.entries[i].isDir && st.entries[i].name == nm) { st.sel = int(i); break; }
-                            st.tab = Tab::Library;
-                            toast(st, "已载入 " + stripExt(nm));
+                            pickRom(st, cfg, fileNameOf(dropped), nullptr);
+                            toast(st, "已载入 " + stripExt(fileNameOf(dropped)));
                         } else {
-                            toast(st, "拖入的不是 .nes 文件", true);
+                            toast(st, "只认目录、.nes 和 .zip", true);
                         }
                     }
                     break;
@@ -1497,6 +1989,31 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                 case SDL_KEYDOWN: {
                     const SDL_Keycode k = e.key.keysym.sym;
                     const bool ctrl = (e.key.keysym.mod & KMOD_CTRL) != 0;
+
+                    // 路径栏要单独处理：它按回车是「跳转」而不是「结束编辑」，
+                    // 走不了下面那套通用文本框逻辑。
+                    if (st.fPath.focused) {
+                        if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                            st.fPath.focused = false;
+                            const std::string p = trimPath(st.fPath.text);
+                            if (p.empty()) {
+                                enterDriveView(st);          // 空输入 = 去「此电脑」
+                            } else if (isDirectory(p)) {
+                                goToDir(st, cfg, p);
+                                cfg.browseDir = st.browseDir;
+                            } else {
+                                toast(st, "目录不存在：" + p, true);
+                            }
+                            break;
+                        }
+                        if (k == SDLK_ESCAPE || k == SDLK_TAB) {
+                            st.fPath.focused = false;        // 放弃本次编辑
+                            break;
+                        }
+                        textFieldInput(st.fPath, e);
+                        break;
+                    }
+
                     // 文本框优先吃键盘
                     bool handled = false;
                     TextField* tfs[6] = { &st.fHostIp, &st.fHostPort, &st.fConnectPort,
@@ -1541,6 +2058,7 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                             if (!st.entries.empty()) {
                                 st.sel = st.sel <= 0 ? 0 : st.sel - 1;
                                 st.scrollTo = std::max(0.0f, st.scrollTo - 58.0f);
+                                syncCursorToView(st, cfg);
                             }
                             break;
                         case SDLK_DOWN:
@@ -1548,6 +2066,7 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                                 st.sel = std::min(int(st.entries.size()) - 1,
                                                   st.sel < 0 ? 0 : st.sel + 1);
                                 st.scrollTo += 58.0f;
+                                syncCursorToView(st, cfg);
                             }
                             break;
                         default:
@@ -1559,6 +2078,15 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                 default:
                     break;
             }
+        }
+
+        // ---------------- 鼠标状态（必须放在事件之后，见上面输入快照处的说明）
+        {
+            int mw = 0, mh = 0;
+            const Uint32 mstate = SDL_GetMouseState(&mw, &mh);
+            in.mx   = float(mw) * dpiK;
+            in.my   = float(mh) * dpiK;
+            in.down = (mstate & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
         }
 
         // ---------------- 更新
@@ -1574,6 +2102,7 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                 }
             }
             // 光标闪烁推进
+            st.fPath.caretT += dt;
             st.fHostIp.caretT += dt;
             st.fHostPort.caretT += dt;
             st.fConnectPort.caretT += dt;
@@ -1653,24 +2182,30 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
 // ================================================================ 离屏预览
 // 只给 --shot 用：造一份临时状态，画一帧静态画面。
 // 有了它，「圆角对不对、字有没有溢出、对齐歪没歪」这类问题就不必每次都跑起来肉眼盯。
-void drawLauncherPreview(ui::Ui& ui, const LaunchConfig& cfg, int tab) {
+void drawLauncherPreview(ui::Ui& ui, const LaunchConfig& cfg, int tab,
+                         const std::vector<UiClick>& clicks) {
     State st;
     st.tab = Tab(std::max(0, std::min(2, tab)));
     st.browseDir = cfg.browseDir.empty() ? exeDir() : cfg.browseDir;
     if (!isDirectory(st.browseDir)) st.browseDir = exeDir();
 
     LaunchConfig copy = cfg;   // 绘制过程会写 cfg（文本框回写等），用副本免得污染调用方
+    resolveZipRom(copy, nullptr);
     reloadDir(st, copy);
 
-    // 挑一个真实存在的 .nes 进详情栏，截图才有内容可看
-    for (size_t i = 0; i < st.entries.size(); ++i) {
-        if (!st.entries[i].isDir && isNesFile(st.entries[i].name)) {
-            st.sel   = int(i);
-            copy.rom = joinPath(st.browseDir, st.entries[i].name);
-            break;
+    // 挑一个真实存在的 .nes 进详情栏，截图才有内容可看。
+    // 已经有可用的 rom（例如配置里存的就是 zip 解压结果）时不覆盖，否则截图会看不到 zip 分支。
+    if (copy.rom.empty() || !fileExists(copy.rom)) {
+        for (size_t i = 0; i < st.entries.size(); ++i) {
+            if (!st.entries[i].isDir && isNesFile(st.entries[i].name)) {
+                st.sel   = int(i);
+                copy.rom = joinPath(st.browseDir, st.entries[i].name);
+                break;
+            }
         }
     }
-    ensureInfo(st);
+    ensureInfoFor(st, copy.rom);
+    ensureZipInfo(st, copy.romZip);
 
     View v;
     v.u   = &ui;
@@ -1681,18 +2216,37 @@ void drawLauncherPreview(ui::Ui& ui, const LaunchConfig& cfg, int tab) {
     v.in.mx = -1000.0f;        // 鼠标放到屏幕外，避免冒出莫名其妙的 hover 态
     v.in.my = -1000.0f;
 
-    ui.clear(theme::bg);
-    ui.gradientV(SDL_Rect{ 0, ui.height() - 280, ui.width(), 280 },
-                 rgba(8, 11, 16, 0), theme::bgGlow);
+    auto frame = [&] {
+        ui.clear(theme::bg);
+        ui.gradientV(SDL_Rect{ 0, ui.height() - 280, ui.width(), 280 },
+                     rgba(8, 11, 16, 0), theme::bgGlow);
+        drawTopBar(v);
+        bool dummy = false;
+        switch (st.tab) {
+            case Tab::Library:  drawLibrary(v, &dummy); break;
+            case Tab::Netplay:  drawNetplay(v); break;
+            case Tab::Settings: drawSettings(v, nullptr, ui.ren(), v.keyConfigPath, &dummy); break;
+        }
+        drawBottomBar(v, &dummy);
+        ui.tick(v.dt);            // 推进缓动，第二帧的 hover / 选中才是稳定态
+    };
 
-    drawTopBar(v);
-    bool dummy = false;
-    switch (st.tab) {
-        case Tab::Library:  drawLibrary(v, &dummy); break;
-        case Tab::Netplay:  drawNetplay(v); break;
-        case Tab::Settings: drawSettings(v, nullptr, ui.ren(), v.keyConfigPath, &dummy); break;
+    // 每个点各占一帧：点击是在绘制过程中被消费的，那一帧画的还是"点之前"的画面；
+    // 紧随其后的第二帧（不再按下、只保留鼠标位置）才是「点了之后长什么样」—— 有用的那张。
+    // 逐个点依次走这套，于是「点此电脑 → 点 N: → 点某个目录」这种多步导航也能复现。
+    for (const UiClick& c : clicks) {
+        if (c.x < 0.0f || c.y < 0.0f) continue;
+        v.in.mx      = c.x;
+        v.in.my      = c.y;
+        v.in.pressed = true;
+        v.in.down    = true;
+        frame();
+
+        v.in.pressed = false;
+        v.in.down    = false;   // 松开：滑杆一类「按住才跟手」的控件靠这帧落定
+        frame();
     }
-    drawBottomBar(v, &dummy);
+    if (clicks.empty()) frame();   // 没有点击时至少出一帧静态画面
 }
 
 } // namespace fc

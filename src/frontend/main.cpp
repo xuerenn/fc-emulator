@@ -67,6 +67,8 @@ struct Options {
     // 开发者自测
     std::string shot;         // --shot <界面名>：把某个界面离屏渲染成图片后退出
     std::string shotFile;     // 输出文件名（.ppm）
+    std::vector<fc::UiClick> uiClicks;  // --ui-click <x>,<y>：截图时按顺序注入的合成点击
+    std::vector<std::pair<std::string, std::string>> cfgSets;  // --cfg-set <键>=<值>：仅本次运行覆盖配置
     int fpsLog = 0;           // 跑满 N 帧后打印实测帧率并退出（0=关闭）
 };
 
@@ -118,6 +120,10 @@ void usage() {
         "开发者自测:\n"
         "  --shot <界面> <文件.ppm>   离屏渲染界面并存图后退出\n"
         "                             界面: launcher | netplay | settings | keys | pause\n"
+        "  --ui-click <x>,<y>         配合 --shot：在该点注入一次点击；可重复给多次，\n"
+        "                             按顺序各占一帧（用来复现「点一下再点一下」的交互缺陷）\n"
+        "  --cfg-set <键>=<值>        仅本次运行覆盖启动器配置，不写回文件；可重复给多次\n"
+        "                             （键名同 fc-launcher.cfg，如 net=1、delay=8、browseDir=C:\\roms）\n"
         "  --fps-log <帧数>           跑满 N 帧后打印实测帧率并退出\n");
 }
 
@@ -179,6 +185,25 @@ bool parseArgs(int argc, char** argv, Options& o) {
             o.shot = next("");
             o.shotFile = next("");
             if (o.shotFile.empty()) o.shotFile = "shot.ppm";
+        } else if (a == "--ui-click") {
+            const std::string v = next("");
+            const size_t comma = v.find(',');
+            if (comma == std::string::npos) {
+                std::fprintf(stderr, "错误: --ui-click 需要 <x>,<y> 形式\n");
+                return false;
+            }
+            fc::UiClick c;
+            c.x = float(std::atof(v.substr(0, comma).c_str()));
+            c.y = float(std::atof(v.substr(comma + 1).c_str()));
+            o.uiClicks.push_back(c);
+        } else if (a == "--cfg-set") {
+            const std::string v = next("");
+            const size_t eq = v.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr, "错误: --cfg-set 需要 <键>=<值> 形式\n");
+                return false;
+            }
+            o.cfgSets.emplace_back(v.substr(0, eq), v.substr(eq + 1));
         } else if (a == "--fps-log") {
             o.fpsLog = std::atoi(next("0").c_str());
         } else if (!a.empty() && a[0] != '-') {
@@ -305,6 +330,20 @@ int main(int argc, char** argv) {
     Options opt;
     if (!parseArgs(argc, argv, opt)) { usage(); return 1; }
 
+    // --cfg-set 的键名先在这里验一遍。放到后面（拿到 cfg 再验）的话，
+    // 报错时 SDL 窗口、渲染器、字体都已经起来了，要么带一堆清理代码退出，
+    // 要么像原来那样 `return false` —— 那等于用退出码 0 报告「参数写错了」。
+    // 用一份临时配置探测，代价是一个结构体的构造。
+    {
+        LaunchConfig probe;
+        for (const auto& kv : opt.cfgSets) {
+            if (!probe.setField(kv.first, kv.second)) {
+                std::fprintf(stderr, "错误: --cfg-set 不认识这个键: %s\n", kv.first.c_str());
+                return 1;
+            }
+        }
+    }
+
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) != 0) {
         std::fprintf(stderr, "SDL 初始化失败: %s\n", SDL_GetError());
@@ -361,6 +400,12 @@ int main(int argc, char** argv) {
     if (opt.noAudio) cfg.audio = false;
     if (!opt.loadState.empty()) cfg.loadState = opt.loadState;
 
+    // --cfg-set 放在最后：它只服务于「离屏截图自测某个界面状态」这种场景
+    // （例如滑杆只在联机分支才画，得先把 net 顶成 1 才截得到），
+    // 所以让它压过前面所有来源，效果最直观。只改内存，不写回配置文件。
+    for (const auto& kv : opt.cfgSets) cfg.setField(kv.first, kv.second);
+    cfg.clamp();
+
     // ------------------------------------------------------------ 离屏截图（开发自测）
     // 这套界面全是像素级细节（圆角、阴影、字体回退、对齐），靠读代码判断不了对错，
     // 必须能一键出图肉眼比对。--shot 就是干这个的。
@@ -395,7 +440,7 @@ int main(int argc, char** argv) {
                 int tab = 0;
                 if (opt.shot == "netplay")  tab = 1;
                 if (opt.shot == "settings") tab = 2;
-                drawLauncherPreview(ui, cfg, tab);
+                drawLauncherPreview(ui, cfg, tab, opt.uiClicks);
             }
 
             std::vector<u32> px(size_t(ui.width()) * size_t(ui.height()));

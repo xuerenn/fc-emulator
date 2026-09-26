@@ -7,6 +7,7 @@
 #include <SDL.h>
 
 #include <string>
+#include <vector>
 
 #include "ui.h"
 
@@ -14,8 +15,13 @@ namespace fc {
 
 // ---------------------------------------------------------------- 启动配置
 struct LaunchConfig {
-    std::string rom;            // 已选 ROM 的路径（空 = 未选）
+    std::string rom;            // 已选 ROM 的**实际文件路径**（空 = 未选）
     std::string browseDir;      // 文件浏览器当前目录（下次打开时恢复）
+
+    // 选的是 zip 时：rom 指向解压出来的缓存文件，这里记住它来自哪个压缩包的哪一条。
+    // 一是为了在界面上说明来源，二是缓存被清掉时能自动重新解一次。
+    std::string romZip;         // 来源压缩包路径（空 = rom 本身就是最终文件）
+    std::string romZipEntry;    // 压缩包内条目名（含包内目录前缀）
 
     enum class Net { Solo, Host, Client };
     Net  net   = Net::Solo;
@@ -42,6 +48,11 @@ struct LaunchConfig {
     bool save(const std::string& path) const;
     static std::string defaultPath();
 
+    // 按名字写单个字段（认得的键见 load 里的那串比较）；返回 false = 键名不认识。
+    bool setField(const std::string& key, const std::string& value);
+    // 把数值字段收进合法区间（端口、delay 等），load / setField 之后调用
+    void clamp();
+
     // 能否开始游戏；不能时 why 给出人话原因
     bool validate(std::string* why) const;
 };
@@ -55,6 +66,15 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, ui::Ui& ui,
 
 // 离屏截图用：把启动器的某一页画成一帧（tab: 0=游戏库 1=联机 2=设置）。
 // 正常使用走 runLauncher，这个只为 --shot 视觉自测服务。
-void drawLauncherPreview(ui::Ui& ui, const LaunchConfig& cfg, int tab);
+//
+// clicks 里的每个点按顺序注入一次「鼠标按下」，各自独占一帧。
+// 这是为交互类 bug 准备的：有些缺陷只在「点某一行之后」才发生（例如点击会改变列表长度、
+// 而迭代仍按旧长度继续），单帧渲染路径下照着截图看不出来，却能靠合成点击稳定复现。
+// 之所以要**一串**而不是一个点：进入子目录这类问题必须「点一下、等界面换了、再点一下」，
+// 只看单次点击是测不到的（见 --ui-click 可重复给值）。
+struct UiClick { float x = -1.0f, y = -1.0f; };
+
+void drawLauncherPreview(ui::Ui& ui, const LaunchConfig& cfg, int tab,
+                         const std::vector<UiClick>& clicks = {});
 
 } // namespace fc
