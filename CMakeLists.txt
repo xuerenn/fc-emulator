@@ -67,6 +67,7 @@ set(FC_CORE_SOURCES
     src/core/cartridge.cpp
     src/core/bus.cpp
     src/core/emulator.cpp
+    src/core/fs_utf8.cpp
     src/net/net.cpp
 )
 

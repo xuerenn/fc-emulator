@@ -1,6 +1,8 @@
 // zipfile.cpp — 最小 ZIP 读取器实现（见 zipfile.h 的设计说明）
 #include "zipfile.h"
 
+#include "core/fs_utf8.h"
+
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -145,7 +147,7 @@ ZipInfo zipOpen(const std::string& zipPath) {
         return zi;
     }
 
-    std::FILE* f = std::fopen(zipPath.c_str(), "rb");
+    std::FILE* f = fc::fopenUtf8(zipPath, "rb");
     if (!f) {
         zi.err = "打不开压缩包";
         return zi;
@@ -267,7 +269,7 @@ bool zipExtractTo(const std::string& zipPath, const ZipEntryInfo& e,
     if (e.usize > kMaxRomBytes) return fail("包内条目过大，已拒绝解压");
     if (e.method != 0 && e.method != 8) return fail("这个条目用了不支持的压缩方式");
 
-    std::FILE* f = std::fopen(zipPath.c_str(), "rb");
+    std::FILE* f = fc::fopenUtf8(zipPath, "rb");
     if (!f) return fail("打不开压缩包");
 
     // 本地头的 name/extra 长度可能与中央目录不一致，必须以本地头为准
@@ -307,7 +309,7 @@ bool zipExtractTo(const std::string& zipPath, const ZipEntryInfo& e,
 #endif
     }
 
-    std::FILE* o = std::fopen(outPath.c_str(), "wb");
+    std::FILE* o = fc::fopenUtf8(outPath, "wb");
     if (!o) return fail("写不出解压结果（目录可能不可写）");
     const size_t w = out.empty() ? 0 : std::fwrite(out.data(), 1, out.size(), o);
     std::fclose(o);

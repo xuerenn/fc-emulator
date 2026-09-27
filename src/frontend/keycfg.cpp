@@ -1,6 +1,8 @@
 // keycfg.cpp — 键位映射实现
 #include "keycfg.h"
 
+#include "core/fs_utf8.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -129,7 +131,7 @@ std::string keyName(SDL_Scancode sc) {
 }
 
 bool KeyMap::save(const std::string& path) const {
-    std::FILE* f = std::fopen(path.c_str(), "wb");
+    std::FILE* f = fc::fopenUtf8(path, "wb");
     if (!f) return false;
 
     std::fprintf(f,
@@ -164,7 +166,7 @@ bool KeyMap::save(const std::string& path) const {
 }
 
 bool KeyMap::load(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = fc::fopenUtf8(path, "rb");
     if (!f) return false;               // 首次运行没有配置文件，保持默认值即可
 
     char line[512];

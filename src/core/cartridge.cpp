@@ -1,6 +1,8 @@
 // cartridge.cpp — iNES 解析与 Mapper 实现
 #include "cartridge.h"
 
+#include "fs_utf8.h"
+
 #include <cstdio>
 
 namespace fc {
@@ -222,7 +224,7 @@ void Cartridge::buildMapper() {
 }
 
 bool Cartridge::loadFromFile(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = fc::fopenUtf8(path, "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
     const long n = std::ftell(f);

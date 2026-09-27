@@ -8,6 +8,7 @@
 #include <string>
 
 #include "core/emulator.h"
+#include "core/fs_utf8.h"
 #include "net/net.h"
 
 #ifdef _WIN32
@@ -19,7 +20,7 @@ using namespace fc;
 namespace {
 
 bool writePPM(const char* path, const u32* fb, int w, int h) {
-    std::FILE* f = std::fopen(path, "wb");
+    std::FILE* f = fc::fopenUtf8(path, "wb");
     if (!f) return false;
     std::fprintf(f, "P6\n%d %d\n255\n", w, h);
     for (int i = 0; i < w * h; ++i) {
@@ -36,7 +37,7 @@ bool writePPM(const char* path, const u32* fb, int w, int h) {
 }
 
 bool readFile(const std::string& path, std::vector<u8>& out) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = fc::fopenUtf8(path, "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
     const long n = std::ftell(f);
@@ -76,6 +77,12 @@ void usage() {
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);   // 源文件中文是 UTF-8，控制台默认 GBK 会乱码
+    // 路径在程序内部一律按 UTF-8 走，而 Windows 的 argv 是系统 ANSI 代码页（中文版
+    // 为 GBK）：先转一次，中文路径的 ROM / 存档才能和 fopen 那边对齐。
+    std::vector<std::string> argvUtf8;
+    argvUtf8.reserve(size_t(argc));
+    for (int i = 0; i < argc; ++i) argvUtf8.push_back(fc::ansiToUtf8(argv[i] ? argv[i] : ""));
+    for (int i = 0; i < argc; ++i) argv[i] = const_cast<char*>(argvUtf8[size_t(i)].c_str());
 #endif
     if (argc < 2) { usage(); return 1; }
 
