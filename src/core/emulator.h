@@ -33,6 +33,8 @@ public:
 
     // ------------------------------------------------ 状态快照（回滚/校验）
     void saveState(std::vector<u8>& out) const;
+    // 只校验格式与卡带指纹，不装载 —— 联机同步前得先确认「这份档本机也认得」
+    bool checkState(const u8* data, size_t n, std::string* why = nullptr) const;
     // 失败时 why 会带上可读原因（档损坏 / 格式过旧 / 与当前 ROM 不匹配）
     bool loadState(const u8* data, size_t n, std::string* why = nullptr);
     u64  stateHash() const;

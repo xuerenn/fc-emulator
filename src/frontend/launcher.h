@@ -40,6 +40,9 @@ struct LaunchConfig {
     int  scale      = 0;                     // 0 = 自动（取窗口能容纳的最大整数倍）
     bool fullscreen = false;
     bool audio      = true;
+    // 离开当前进度前（暂停菜单里的「重启卡带」「换一张卡带」）要不要自动存一次档。
+    // 开着更不容易丢进度，但不是所有人都想要一堆意外生成的 .fcstate —— 所以交给用户定。
+    bool autoSave   = true;
 
     std::string keyFile;                     // 空 = 用默认位置
 
@@ -57,23 +60,35 @@ struct LaunchConfig {
     bool validate(std::string* why) const;
 };
 
+// ---------------------------------------------------------------- 合成点击（开发者自测）
+// 一个点 = 依次注入一次「鼠标按下」。正常路径下做不了的事（点某一行、再点某一行），
+// 靠它就能无人值守地复现：有些缺陷只在「点下去之后」才发生。
+struct UiClick { float x = -1.0f, y = -1.0f; };
+
 // ---------------------------------------------------------------- 启动器
+// 调用方塞给启动器的一点额外信息，都是给「从游戏里返回列表」和开发者自测用的。
+struct LauncherHandoff {
+    std::string toast;                 // 挂在启动器上的一句话（空 = 不显示）
+    bool        toastWarn  = false;    // 用警示色还是普通色
+    bool        autoStart  = false;    // 开发者自测：不等点击，几帧后直接开跑
+    // 开发者自测：在启动器**实跑**的这一轮里按帧依次注入的合成点击。
+    // 和 --shot 的离屏预览是同一套点，但这里走的是真实交互循环 ——
+    // 「点一行 → 再点一行」这种多步操作只有在这里才测得准。
+    std::vector<UiClick> clicks;
+};
+
 // 阻塞运行主界面，直到用户点「开始游戏」或关闭窗口。
 //   返回 true  = 开始游戏，state 已按用户选择更新（调用方负责 save）
 //   返回 false = 用户要求退出程序
 bool runLauncher(SDL_Window* win, SDL_Renderer* ren, ui::Ui& ui,
-                 LaunchConfig& state, const std::string& keyConfigPath);
+                 LaunchConfig& state, const std::string& keyConfigPath,
+                 const LauncherHandoff& handoff = {});
 
 // 离屏截图用：把启动器的某一页画成一帧（tab: 0=游戏库 1=联机 2=设置）。
 // 正常使用走 runLauncher，这个只为 --shot 视觉自测服务。
 //
-// clicks 里的每个点按顺序注入一次「鼠标按下」，各自独占一帧。
-// 这是为交互类 bug 准备的：有些缺陷只在「点某一行之后」才发生（例如点击会改变列表长度、
-// 而迭代仍按旧长度继续），单帧渲染路径下照着截图看不出来，却能靠合成点击稳定复现。
-// 之所以要**一串**而不是一个点：进入子目录这类问题必须「点一下、等界面换了、再点一下」，
-// 只看单次点击是测不到的（见 --ui-click 可重复给值）。
-struct UiClick { float x = -1.0f, y = -1.0f; };
-
+// clicks 见上面的 UiClick。这里的实现是「一帧画完算数」，所以整串点会在同一次调用里
+// 依次消费；要测多步操作（点一下、等界面换了、再点一下）请走 runLauncher 那条路。
 void drawLauncherPreview(ui::Ui& ui, const LaunchConfig& cfg, int tab,
                          const std::vector<UiClick>& clicks = {});
 

@@ -55,6 +55,19 @@ void menuIcon(Ui& u, int kind, int cx, int cy, const RGBA& c) {
             u.roundOutline(SDL_Rect{ cx - 10, cy - 8, 20, 16 }, 2, 2, c);
             u.roundOutline(SDL_Rect{ cx - 5, cy - 4, 10, 8 }, 2, 2, c);
             break;
+        case 6:   // 重启卡带：环形箭头。缺口开在右边、箭头指回起点，
+                  // 对应主机上那颗 Reset —— 多合一卡带按一下就回到自己的游戏菜单。
+            u.ring(cx, cy, 8, 2, c, 40, 320);
+            u.tri(cx + 8, cy - 11, cx + 13, cy - 4, cx + 3, cy - 3, c);
+            break;
+        case 7:   // 换卡带：2x2 的卡带格（一堆卡带，不是「返回箭头」——
+                  // 箭头在这个图标位太容易被误读成「上一页 / 后退一步」）
+            for (int i = 0; i < 4; ++i) {
+                const int sx = (i & 1) ? 2 : -9;
+                const int sy = (i & 2) ? 2 : -9;
+                u.round(SDL_Rect{ cx + sx, cy + sy, 7, 7 }, 2, c);
+            }
+            break;
         default:  // 退出：电源符号
             u.ring(cx, cy + 1, 8, 2, c, 300, 360);
             u.ring(cx, cy + 1, 8, 2, c, 0, 240);
@@ -93,14 +106,29 @@ PauseAction pauseMenuFrame(Ui& ui, const PauseInfo& info, const Input& in, doubl
     };
 
     const std::string scaleHint = scaleLabel(info.scale);
+    // 「离开当前进度」的两项都受这一个开关支配，右栏如实反映 ——
+    // 关掉自动存档后还写「先自动存档」就是在骗人。
+    const std::string leaveHint = info.autoSave ? "先自动存档" : "不自动存档";
     const std::vector<Item> items = {
         { "继续游戏", "F1 / Esc",  0, PauseAction::Resume,            true,  nullptr },
         { "保存存档", "F5",        1, PauseAction::SaveState,         true,  nullptr },
-        { "读取存档", "F8",        2, PauseAction::LoadState,         !info.netActive, "联机中不可用" },
+        // 联机时读档要让两端拿到同一份档，所以它不再是「本地读出来就行」，
+        // 而是「把这份档同步给对方」。F8 那条路走的是同一套逻辑。
+        { "读取存档", info.netActive ? "同步给对方" : "F8",
+                                   2, PauseAction::LoadState,         true,  nullptr },
         { "键位设置", "F2",        3, PauseAction::KeyConfig,         !info.netActive, "联机中不可用" },
         { "切换全屏", "F11",       4, PauseAction::ToggleFullscreen,  true,  nullptr },
         { "画面缩放", "",          5, PauseAction::CycleScale,        true,  nullptr },
-        { "退出游戏", "Esc",       6, PauseAction::Quit,              true,  nullptr },
+        // 同一张卡带里的另一个游戏：按一下等价于按主机的 Reset，卡带会回到自己的菜单。
+        // 联机中同样可用 —— 走的是和「读取存档」同一套同步协议：本机先 reset 出一份
+        // 「刚开机」的快照发给对端，两端一起落到那个状态，所以不会各跑各的。
+        { "重启卡带", info.netActive ? "同步给对方" : "回到卡带菜单",
+                                   6, PauseAction::ResetCart,        true,  nullptr },
+        // 换游戏会丢掉当前进度，所以这一项（默认）先自动存一次档；右栏直接写明。
+        // 联机里也开放：干净断开（对端会跟着回列表），两边各自挑好卡带再重新连。
+        { "换一张卡带", info.netActive ? "断开重连" : leaveHint.c_str(), 7,
+                                   PauseAction::ToLibrary,          true,  nullptr },
+        { "退出游戏", "Esc",       8, PauseAction::Quit,              true,  nullptr },
     };
 
     const int ph = kHeaderH + int(items.size()) * kItemH + kFooterH;

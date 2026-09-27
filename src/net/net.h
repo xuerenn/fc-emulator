@@ -68,6 +68,22 @@ struct RelayConfig {
 constexpr int kRelayDefaultDelay = 6;
 
 // ================================================================ 联机会话
+//
+// 存档同步（联机中读档）为什么必须做成「传档」而不是各自读各自的：
+// 锁步要求两端在同一帧上状态逐位一致。只要两端的档有一丁点不同，下一个
+// 哈希比对点就会报警，而且不可能自行收敛。所以由一方把快照原样传过去。
+//
+// 时序（发起方 = 数据源，接收方 = 照单全收）：
+//   发起方 ── META + CHUNK… ──▶ 接收方   分块传；接收方按位图 ACK，缺块自动重传
+//   发起方 ◀──── DONE ──────── 接收方   收齐且 CRC32 校验通过
+//   发起方 重置采样序号（epoch+1，旧包全作废）
+//   发起方 ────── GO ────────▶ 接收方   接收方此刻也重置序号、装上这份档
+//   发起方 ◀──── APPLIED ───── 接收方
+//   发起方 装上这份档，两端继续跑
+//
+// 非重置采样序号不可：传输期间两端停在不同帧上，序号已经错开；不重置的话
+// 恢复后会把「不同的输入」喂给同一帧。重置 = 两端都从 0 重新起算，正好对齐。
+// epoch 则负责把还在路上、序号属于旧体系的输入包全部丢掉。
 class NetSession {
 public:
     enum class Role { None, Host, Client };
@@ -90,7 +106,9 @@ public:
                            const WaitHook& onWait = {});
     bool startClientViaRelay(const RelayConfig& relay, int inputDelay, std::string* err = nullptr,
                              const WaitHook& onWait = {});
-    void stop();
+    // 结束会话。announceLibrary = true 时给对端发的断开包带上「我去换卡带了」的原因，
+    // 对端前端收到后会跟着回启动器，而不是切回单机干等。
+    void stop(bool announceLibrary = false);
 
     bool active() const { return role_ != Role::None; }
     Role role() const { return role_; }
@@ -103,6 +121,12 @@ public:
     // 中继模式相关
     bool relayed() const { return relayed_; }
     const RelayConfig& relayConfig() const { return relayCfg_; }
+
+    // 卡带指纹（FNV-1a 64，整个 ROM 文件）。握手完成后两端会互发一次做校验，
+    // 不一致直接报「两端的卡带不是同一份」并拒绝建立会话 ——
+    // 不然「各自选卡带后重连」选错了，只会看到一句莫名其妙的「检测到状态不同步」。
+    void setLocalRomHash(u64 h) { localRomHash_ = h; }
+    bool peerWentToLibrary() const { return peerToLibrary_; }
 
     // 每帧调用一次：
     //   1) 记录并广播本帧物理输入
@@ -130,6 +154,21 @@ public:
 
     const SyncStrategy& strategy() const { return *strategy_; }
 
+    // ------------------------------------------------ 存档同步（联机中读档）
+    // 发起：本机是数据源，把 snapshot 同步给对端，最后两端都跑这一份档。
+    // 传完之前本机不能推进模拟（stateSyncing() 为真时主循环必须停帧），
+    // 否则两边会各自跑飞。
+    void beginStateSync(const std::vector<u8>& snapshot);
+    bool stateSyncing() const { return xfer_ != Xfer::None; }
+    bool stateSending() const { return xfer_ == Xfer::Sending; }
+    int  statePercent() const;
+    const std::string& stateError() const { return xferErr_; }
+
+    // 非阻塞推进收发。返回 true = 本帧要把 out 灌进 Emulator（每次同步只会为真一次）。
+    bool pumpStateSync(std::vector<u8>& out);
+    // 收尾（成功或失败都走这里），退回 Idle
+    void endStateSync();
+
 private:
     struct Slot { u32 frame = 0xFFFFFFFFu; u8 input = 0; };
 
@@ -150,6 +189,8 @@ private:
     bool handshakeHost(std::string* err, const WaitHook& onWait);
     bool handshakeClient(const std::string& host, u16 port, std::string* err,
                          const WaitHook& onWait);
+    // 握手成功后互发一次卡带指纹；不一致或等不到都算建会话失败
+    bool exchangeRomHash(std::string* err, const WaitHook& onWait);
     bool sendPacket(u8 type);
     void drainIncoming();
     bool waitForRemote(u32 frame, int timeoutMs);
@@ -174,6 +215,9 @@ private:
     // 中继状态
     RelayConfig relayCfg_;
     bool relayed_ = false;
+    u64  localRomHash_  = 0;      // 本机卡带指纹（前端在 start* 前设置；0 = 不校验）
+    u64  peerRomHash_   = 0;
+    bool peerToLibrary_ = false;  // 对端断开的原因是「去换卡带了」
     bool relayReachable_ = false;   // 中继至少回过一次包（用于区分「服务器不通」和「对端没来」）
 
     std::array<Slot, BUF> local_{};
@@ -184,6 +228,49 @@ private:
     DesyncInfo desyncInfo_{};
     bool desyncPending_ = false;   // 有未播报的不同步事件
     u32  desyncCount_ = 0;
+
+    // ---- 存档同步的状态机
+    enum class Xfer { None, Sending, Receiving };
+    enum class XferStage {
+        Idle,
+        SendChunks,    // 发送方：推窗口、等 ACK
+        WaitDone,      // 发送方：数据发完，等接收方报「收齐了」
+        WaitApplied,   // 发送方：已发 GO，等接收方报「装上了」
+        RecvChunks,    // 接收方：攒块
+        WaitGo,        // 接收方：攒齐了，等 GO
+    };
+
+    void handleStatePacket(u8 type, const u8* buf, int n);
+    void pumpStateSend();
+    void sendStateMeta();            // 开场包：告诉对端「我要发档，多大、校验和多少」
+    void sendStateAck();
+    void sendStateCtl(u8 type);
+    void failStateSync(const char* why);
+    bool xferTimedOut(u32 now);
+
+    Xfer      xfer_  = Xfer::None;
+    XferStage stage_ = XferStage::Idle;
+    std::vector<u8> xferOut_;      // 发送方：待发的快照
+    std::vector<u8> xferIn_;       // 接收方：拼装缓冲
+    std::vector<u8> xferFlag_;     // 接收方：逐块到位标记
+    u32  xferTotal_   = 0;         // 快照总字节
+    u32  xferChunks_  = 0;         // 总块数
+    u32  xferCrc_     = 0;         // 快照 CRC32
+    u32  xferBase_    = 0;         // 发送方：窗口起点（块号）
+    u64  xferAckBits_ = 0;         // 发送方：窗口内已确认的块（相对 xferBase_）
+    u32  xferGot_     = 0;         // 接收方：已到位的块数
+    u32  xferRecvBase_ = 0;        // 接收方：最小的还没到位的块号（回执里的 base）
+    u32  xferLastTx_  = 0;
+    u32  xferLastCtl_ = 0;
+    u32  xferStartMs_ = 0;
+    u8   xferEpoch_   = 0;         // 同步完成后启用的新代次
+    bool xferApply_   = false;     // 本帧该装档（pumpStateSync 取走）
+    bool xferStarted_ = false;     // 对端已回应过（说明它收到了开场包，进入了接收态）
+    std::string xferErr_;
+
+    // 输入包代次。重置采样序号时必须 +1：传输期间两端停在不同帧上，旧包还在路上，
+    // 它们带的帧号在新体系里会正好落进环形缓冲的空位，被当成有效输入。
+    u8   epoch_ = 0;
 
     std::unique_ptr<SyncStrategy> strategy_;
 };

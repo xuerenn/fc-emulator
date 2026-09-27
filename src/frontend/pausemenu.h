@@ -22,6 +22,14 @@ enum class PauseAction {
     KeyConfig,
     ToggleFullscreen,
     CycleScale,
+    // 重启卡带：等价于按下主机的 Reset。多合一卡带（68 in 1 之类）开机先进自己的
+    // 菜单，Reset 就又回到那个菜单 —— 想玩同一张卡带里的另一个游戏走这条，
+    // 不用回启动器、更不用换卡带。
+    ResetCart,
+    // 退回启动器的列表换一张卡带。真正的动作在主循环里：按 autoSave 决定要不要
+    // 先自动存一次档，再收掉本回合的联机/音频/纹理，让外层循环重新走一遍
+    // 「挑卡带 → 跑游戏」。
+    ToLibrary,
     Quit,
 };
 
@@ -41,6 +49,7 @@ struct PauseInfo {
     bool  hasState   = false;    // 磁盘上有存档
     bool  fullscreen = false;
     int   scale      = 0;        // 0 = 自动
+    bool  autoSave   = true;     // 离开当前进度前（重启卡带 / 换卡带）要不要自动存档
 
     // 一次性提示（调用方注入，例如「联机中不能读档」）
     std::string toast;

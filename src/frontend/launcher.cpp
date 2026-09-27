@@ -10,6 +10,7 @@
 #include "launcher.h"
 
 #include "core/cartridge.h"
+#include "core/fs_utf8.h"
 #include "keycfg.h"
 #include "keyscreen.h"
 #include "zipfile.h"
@@ -362,7 +363,7 @@ RomInfo inspectRom(const std::string& path) {
     r.hasState  = fileExists(r.statePath);
     r.mapperName = mapperLabel(0);
 
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = fc::fopenUtf8(path, "rb");
     if (!f) return r;
     u8 h[16]{};
     const size_t got = std::fread(h, 1, 16, f);
@@ -808,7 +809,7 @@ bool readKV(std::FILE* f, std::string& k, std::string& v) {
 } // namespace
 
 bool LaunchConfig::save(const std::string& path) const {
-    std::FILE* f = std::fopen(path.c_str(), "wb");
+    std::FILE* f = fc::fopenUtf8(path, "wb");
     if (!f) return false;
     std::fprintf(f, "# fc-emulator 启动器配置（程序自动维护，可手改）\n");
     writeKV(f, "rom",         rom);
@@ -828,6 +829,7 @@ bool LaunchConfig::save(const std::string& path) const {
     writeKV(f, "scale",       std::to_string(scale));
     writeKV(f, "fullscreen",  fullscreen ? "1" : "0");
     writeKV(f, "audio",       audio ? "1" : "0");
+    writeKV(f, "autoSave",    autoSave ? "1" : "0");
     writeKV(f, "keyFile",     keyFile);
     std::fclose(f);
     return true;
@@ -855,6 +857,7 @@ bool LaunchConfig::setField(const std::string& k, const std::string& v) {
     else if (k == "scale")       scale = std::atoi(v.c_str());
     else if (k == "fullscreen")  fullscreen = (v == "1");
     else if (k == "audio")       audio = (v == "1");
+    else if (k == "autoSave")    autoSave = (v == "1");
     else if (k == "keyFile")     keyFile = v;
     else return false;
     return true;
@@ -870,7 +873,7 @@ void LaunchConfig::clamp() {
 }
 
 bool LaunchConfig::load(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = fc::fopenUtf8(path, "rb");
     if (!f) return false;
     std::string k, v;
     while (readKV(f, k, v)) setField(k, v);
@@ -1067,13 +1070,13 @@ bool useZipRom(State& st, LaunchConfig& cfg, const std::string& zipPath,
     const std::string tmp = out + ".tmp";
     std::string err;
     if (!zipExtractTo(zipPath, entry, tmp, &err)) {
-        std::remove(tmp.c_str());
+        fc::removeUtf8(tmp);
         toast(st, "解压失败：" + err, true);
         return false;
     }
-    std::remove(out.c_str());
-    if (std::rename(tmp.c_str(), out.c_str()) != 0) {
-        std::remove(tmp.c_str());
+    fc::removeUtf8(out);
+    if (fc::renameUtf8(tmp, out) != 0) {
+        fc::removeUtf8(tmp);
         toast(st, "无法写入解压结果：" + out, true);
         return false;
     }
@@ -1122,9 +1125,13 @@ void pickRom(State& st, LaunchConfig& cfg, const std::string& name, bool* wantSt
         return;
     }
 
+    // 换卡带就别再惦记上一张的档了 —— 拿 A 的档去读 B，轻则读档失败、重则状态错乱。
+    // useZipRom 里也有同一句，两边必须都在：zip 与普通 .nes 是两条独立的路径。
+    const bool switched = (cfg.rom != full);
     cfg.rom = full;
     cfg.romZip.clear();
     cfg.romZipEntry.clear();
+    if (switched) cfg.loadState.clear();
     if (wantStart) *wantStart = true;
 }
 
@@ -1747,8 +1754,8 @@ void drawSettings(View& v, SDL_Window* win, SDL_Renderer* ren, const std::string
 
     // 先把总高算出来：窗口矮的时候（比如拉到最小尺寸）内容会超出一屏，
     // 那就得能滚 —— 卡在底栏后面看不见是最尴尬的。
-    const int hDisplay = 168, hAudio = 100, hKeys = 110, hAbout = 104;
-    const int contentH = hDisplay + gap + hAudio + gap + hKeys + gap + hAbout;
+    const int hDisplay = 168, hAudio = 100, hSave = 100, hKeys = 110, hAbout = 104;
+    const int contentH = hDisplay + gap + hAudio + gap + hSave + gap + hKeys + gap + hAbout;
     const float maxScroll = std::max(0.0f, float(contentH - viewH + 8));
     st.settingsScroll = std::max(0.0f, std::min(st.settingsScroll, maxScroll));
 
@@ -1786,6 +1793,21 @@ void drawSettings(View& v, SDL_Window* win, SDL_Renderer* ren, const std::string
         const SDL_Rect row{ c.x + 12, c.y + 46, colW - 24, 46 };
         if (switchRow(u, v.F(), v.dt, "au", row, "启用音频", "关闭后静音运行，模拟速度不受影响", cfg.audio))
             cfg.audio = !cfg.audio;
+        y = c.y + c.h + gap;
+    }
+
+    // ---- 存档
+    {
+        const SDL_Rect c{ x0, y, colW, hSave };
+        cardShell(u, c, true);
+        u.text(Font::Title, "存档", c.x + 20, c.y + 14, theme::text);
+        // 只影响暂停菜单里那两项「离开当前进度」的动作（重启卡带 / 换一张卡带）；
+        // 手按 F5 存档不受它管。
+        const SDL_Rect row{ c.x + 12, c.y + 46, colW - 24, 46 };
+        if (switchRow(u, v.F(), v.dt, "as", row, "离开时自动存档",
+                      "暂停菜单里「重启卡带 / 换一张卡带」前先存一次（F5 手动存档不受影响）",
+                      cfg.autoSave))
+            cfg.autoSave = !cfg.autoSave;
         y = c.y + c.h + gap;
     }
 
@@ -1841,7 +1863,8 @@ void drawSettings(View& v, SDL_Window* win, SDL_Renderer* ren, const std::string
 // ================================================================ 入口
 
 bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
-                 LaunchConfig& cfg, const std::string& keyConfigPath) {
+                 LaunchConfig& cfg, const std::string& keyConfigPath,
+                 const LauncherHandoff& handoff) {
     if (!ui.fontsOk()) {
         std::fprintf(stderr, "启动器无法运行：%s\n", ui.diag().c_str());
         return false;
@@ -1871,6 +1894,13 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
     cfg.browseDir = st.browseDir;
     reloadDir(st, cfg);
 
+    // 「启动时载入存档」指向的文件可能已经不在磁盘上了（在外面删了、跟着卡带一起搬走了）。
+    // 这里就地清掉，而不是留给主流程去报错 —— 一个早就没了的档，不该让游戏直接启动失败。
+    if (!cfg.loadState.empty() && !fileExists(cfg.loadState)) {
+        std::printf("[启动器] 配置里的存档已不存在，已取消启动读档: %s\n", cfg.loadState.c_str());
+        cfg.loadState.clear();
+    }
+
     // 上次选的是 zip 里的 ROM 的话，把解压缓存补齐（见 resolveZipRom）
     {
         std::string zw;
@@ -1878,10 +1908,25 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
         if (!zw.empty()) toast(st, zw, true);
     }
 
+    // 从游戏里返回列表时带回来的话（例如刚自动存过档）。放在最后，压过前面那些提示 ——
+    // 用户刚点完按钮，最想看到的正是这一条。同时打一条日志：界面上的 toast 只活两秒多，
+    // 事后想确认「那一局到底存没存上」只能靠控制台。
+    if (!handoff.toast.empty()) {
+        std::printf("[启动器] %s\n", handoff.toast.c_str());
+        toast(st, handoff.toast, handoff.toastWarn);
+    }
+
+    // 标题栏也要接管：游戏循环每 500ms 往标题里写「ROM | FPS … | Esc 菜单」，
+    // 从游戏里退回来时不改的话，启动器会顶着一行游戏内信息。第一次进来时这里
+    // 写的就是 SDL 建窗时那个名字，所以两种进入方式看起来一致。
+    SDL_SetWindowTitle(win, "fc-emulator");
+
     bool running = true;
     bool wantStart = false;
     bool wantKeyEditor = false;
     bool wantQuit = false;
+    int  autoStartFrames = 0;
+    size_t uiClickFrame   = 0;      // 合成点击消费到第几帧（每个点两帧）
 
     SDL_StartTextInput();
 
@@ -2089,6 +2134,26 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
             in.down = (mstate & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
         }
 
+        // ---------------- 开发者自测：不等点击，直接开跑
+        // 给「游戏 → 暂停菜单 → 返回列表 → 再进游戏」这条回路用的。没有它，第二回合
+        // 会卡在启动器上等一次人手点击，整条回路也就没法无人值守地跑一遍 ——
+        // 而那正是最容易出错的一段（句柄要在两回合之间换来换去）。
+        if (handoff.autoStart && ++autoStartFrames >= 4) wantStart = true;
+
+        // ---------------- 开发者自测：注入合成点击（--ui-click）
+        // 每个点占两帧：第一帧按下（控件在这一帧被点中），第二帧松开 —— 不松开的话，
+        // 「按下沿」只来一次，后续帧控件会以为自己一直被按着。坐标按渲染像素给，
+        // 和鼠标状态一样不受 dpiK 影响（dpiK 只用于把窗口坐标换算过来）。
+        if (uiClickFrame < handoff.clicks.size() * 2) {
+            const UiClick& c = handoff.clicks[uiClickFrame / 2];
+            const bool down = (uiClickFrame % 2) == 0;
+            in.mx      = c.x;
+            in.my      = c.y;
+            in.pressed = down;
+            in.down    = down;
+            ++uiClickFrame;
+        }
+
         // ---------------- 更新
         {
             const float wheel = in.wheel;
@@ -2171,7 +2236,10 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
 
     // 界面上的临时状态写回配置并落盘
     cfg.browseDir = st.browseDir;
-    if (cfg.net == LaunchConfig::Net::Solo) cfg.loadState.clear();
+    // 这里曾经有一句「单机就把 loadState 清掉」。它的本意大概是「别把一次性的读档开关
+    // 粘到配置文件里」，但副作用是这个开关在单机下**完全失效**：界面明明写着「启动时会从
+    // 这个存档继续」，点开始游戏却永远从开机状态起跑 —— 返回游戏列表时的自动存档也就白存了。
+    // 现在按界面上写的那样让它生效：开关是粘性的，换卡带时 pickRom 会自己清掉。
 
     if (cfg.save(LaunchConfig::defaultPath()))
         std::printf("启动器配置已保存: %s\n", LaunchConfig::defaultPath().c_str());
