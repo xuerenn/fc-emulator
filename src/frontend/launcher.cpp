@@ -719,7 +719,7 @@ std::vector<std::string> wrapText(Ui& u, Font role, const std::string& text, int
 
 // 卡带图标（详情页大图标 / 列表小图标共用）
 void cartridgeIcon(Ui& u, const SDL_Rect& r, const RGBA& body, const RGBA& ink) {
-    const int rad = std::max(3, r.w / 8);
+    const int rad = (std::max)(3, r.w / 8);
     u.round(r, rad, body);
     // 上方的标签条
     u.round(SDL_Rect{ r.x + r.w / 6, r.y + r.h / 8, r.w * 2 / 3, r.h / 4 }, rad / 2, ink);
@@ -1225,8 +1225,8 @@ void resolveZipRom(LaunchConfig& cfg, std::string* warn) {
 void fitScroll(View& v, int listH, int itemH) {
     State& st = *v.st;
     const int total = int(st.entries.size()) * itemH;
-    const int maxScroll = std::max(0, total - listH + 8);
-    st.scrollTo = std::max(0.0f, std::min(st.scrollTo, float(maxScroll)));
+    const int maxScroll = (std::max)(0, total - listH + 8);
+    st.scrollTo = (std::max)(0.0f, (std::min)(st.scrollTo, float(maxScroll)));
     st.scroll = Ui::approach(st.scroll, st.scrollTo, 18.0f, v.dt);
 }
 
@@ -1237,7 +1237,7 @@ void drawLibrary(View& v, bool* wantStart) {
     const int W = u.width(), H = u.height();
     const int top = kTopBarH, bottom = H - kBottomBarH;
 
-    const int listW = std::max(360, std::min(480, int(float(W) * 0.36f)));
+    const int listW = (std::max)(360, (std::min)(480, int(float(W) * 0.36f)));
     const SDL_Rect listCard{ kPad, top + 8, listW, bottom - top - 24 };
     const SDL_Rect detailCard{ kPad + listW + 18, top + 8,
                                W - kPad * 2 - listW - 18, bottom - top - 24 };
@@ -1294,8 +1294,8 @@ void drawLibrary(View& v, bool* wantStart) {
     fitScroll(v, listArea.h, itemH);
 
     SDL_RenderSetClipRect(u.ren(), &listArea);
-    const int first = std::max(0, int(st.scroll / float(itemH)));
-    const int last  = std::min(int(st.entries.size()), first + listArea.h / itemH + 2);
+    const int first = (std::max)(0, int(st.scroll / float(itemH)));
+    const int last  = (std::min)(int(st.entries.size()), first + listArea.h / itemH + 2);
 
     if (st.entries.empty()) {
         u.textCenter(Font::Small, st.driveView ? "没有检测到可用的盘符" : "这个目录里没有可显示的内容",
@@ -1414,8 +1414,8 @@ void drawLibrary(View& v, bool* wantStart) {
     if (int(st.entries.size()) * itemH > listArea.h) {
         const float visible = float(listArea.h) / float(int(st.entries.size()) * itemH);
         const float total   = float(int(st.entries.size()) * itemH);
-        const int barH = std::max(28, int(float(listArea.h) * visible));
-        const int barY = listArea.y + int((float(listArea.h) - barH) * (st.scroll / std::max(1.0f, total - listArea.h)));
+        const int barH = (std::max)(28, int(float(listArea.h) * visible));
+        const int barY = listArea.y + int((float(listArea.h) - barH) * (st.scroll / (std::max)(1.0f, total - listArea.h)));
         u.round(SDL_Rect{ listArea.x + listArea.w - 6, barY, 4, barH }, 2, theme::borderHi);
     }
 
@@ -1526,7 +1526,7 @@ void drawLibrary(View& v, bool* wantStart) {
         const int right = detailCard.x + detailCard.w - 28;
         for (const ZipEntryInfo& ze : st.zip.roms) {
             const std::string label = fileNameOf(ze.name);
-            const int w = std::min(230, u.measure(Font::Small, label) + 26);
+            const int w = (std::min)(230, u.measure(Font::Small, label) + 26);
             if (cxp + w > right) {                       // 一行放不下就不再往下画
                 u.text(Font::Small, "…", cxp + 2, chipY + 6, theme::textFaint);
                 break;
@@ -1560,7 +1560,7 @@ void drawNetplay(View& v) {
     const int W = u.width();
     int top = kTopBarH + 8;
 
-    const int colW = std::min(860, W - kPad * 2);
+    const int colW = (std::min)(860, W - kPad * 2);
     const int x0 = (W - colW) / 2;
 
     // ---- 卡片 1：对局模式
@@ -1680,8 +1680,8 @@ void drawNetplay(View& v) {
         // 表现就是「按住拖完全没反应」。所以先处理释放，再处理按下。
         const SDL_Rect hit{ track.x - 12, track.y - 16, track.w + 24, 40 };
         auto delayFromMouse = [&] {
-            const float t = float(v.F().mx - float(track.x)) / float(std::max(1, track.w));
-            return std::max(0, std::min(30, int(t * 30.0f + 0.5f)));
+            const float t = float(v.F().mx - float(track.x)) / float((std::max)(1, track.w));
+            return (std::max)(0, (std::min)(30, int(t * 30.0f + 0.5f)));
         };
         if (!v.F().down) st.draggingDelay = false;
         if (v.F().pressed && v.F().inside(hit)) {
@@ -1746,9 +1746,9 @@ void drawSettings(View& v, SDL_Window* win, SDL_Renderer* ren, const std::string
     LaunchConfig& cfg = *v.cfg;
     const int W = u.width(), H = u.height();
     const int top = kTopBarH + 8;
-    const int viewH = std::max(120, H - kBottomBarH - top - 8);
+    const int viewH = (std::max)(120, H - kBottomBarH - top - 8);
 
-    const int colW = std::min(860, W - kPad * 2);
+    const int colW = (std::min)(860, W - kPad * 2);
     const int x0 = (W - colW) / 2;
     const int gap = 12;
 
@@ -1756,8 +1756,8 @@ void drawSettings(View& v, SDL_Window* win, SDL_Renderer* ren, const std::string
     // 那就得能滚 —— 卡在底栏后面看不见是最尴尬的。
     const int hDisplay = 168, hAudio = 100, hSave = 100, hKeys = 110, hAbout = 104;
     const int contentH = hDisplay + gap + hAudio + gap + hSave + gap + hKeys + gap + hAbout;
-    const float maxScroll = std::max(0.0f, float(contentH - viewH + 8));
-    st.settingsScroll = std::max(0.0f, std::min(st.settingsScroll, maxScroll));
+    const float maxScroll = (std::max)(0.0f, float(contentH - viewH + 8));
+    st.settingsScroll = (std::max)(0.0f, (std::min)(st.settingsScroll, maxScroll));
 
     const SDL_Rect clip{ 0, top, W, viewH };
     SDL_RenderSetClipRect(ren, &clip);
@@ -1850,9 +1850,9 @@ void drawSettings(View& v, SDL_Window* win, SDL_Renderer* ren, const std::string
     SDL_RenderSetClipRect(ren, nullptr);
 
     // ---- 滚动条（只有超高时才出现）
-    if (maxScroll > 0.5f) {
+        if (maxScroll > 0.5f) {
         const float visible = float(viewH) / float(contentH);
-        const int barH = std::max(30, int(float(viewH) * visible));
+        const int barH = (std::max)(30, int(float(viewH) * visible));   
         const int barY = top + int((float(viewH) - barH) * (st.settingsScroll / maxScroll));
         u.round(SDL_Rect{ W - 10, barY, 4, barH }, 2, theme::borderHi);
     }
@@ -2102,13 +2102,13 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
                         case SDLK_UP:
                             if (!st.entries.empty()) {
                                 st.sel = st.sel <= 0 ? 0 : st.sel - 1;
-                                st.scrollTo = std::max(0.0f, st.scrollTo - 58.0f);
+                                st.scrollTo = (std::max)(0.0f, st.scrollTo - 58.0f);
                                 syncCursorToView(st, cfg);
                             }
                             break;
                         case SDLK_DOWN:
                             if (!st.entries.empty()) {
-                                st.sel = std::min(int(st.entries.size()) - 1,
+                                st.sel = (std::min)(int(st.entries.size()) - 1,
                                                   st.sel < 0 ? 0 : st.sel + 1);
                                 st.scrollTo += 58.0f;
                                 syncCursorToView(st, cfg);
@@ -2253,7 +2253,7 @@ bool runLauncher(SDL_Window* win, SDL_Renderer* ren, Ui& ui,
 void drawLauncherPreview(ui::Ui& ui, const LaunchConfig& cfg, int tab,
                          const std::vector<UiClick>& clicks) {
     State st;
-    st.tab = Tab(std::max(0, std::min(2, tab)));
+    st.tab = Tab((std::max)(0, (std::min)(2, tab)));
     st.browseDir = cfg.browseDir.empty() ? exeDir() : cfg.browseDir;
     if (!isDirectory(st.browseDir)) st.browseDir = exeDir();
 

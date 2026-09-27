@@ -196,8 +196,10 @@ SDL_Texture* Ui::maskTex(int w, int h, int rad, int thickness) {
     SDL_FreeSurface(surf);
     if (tex) SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
 
-    masks_[key] = tex;
+    // 先清理再插入：清理会销毁整个缓存，若放在插入之后就等于把刚建好、
+    // 正要返回给调用方的纹理一起销毁 —— 调用方随后拿悬空指针去 RenderCopy 会崩。
     purgeIfNeeded();
+    masks_[key] = tex;
     return tex;
 }
 
@@ -377,8 +379,8 @@ SDL_Texture* Ui::textTex(Font role, const std::string& s, const RGBA& c, int* ow
     SDL_FreeSurface(surf);
     if (tex) SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
 
-    texts_[key] = tex;
     purgeIfNeeded();
+    texts_[key] = tex;
     return tex;
 }
 
